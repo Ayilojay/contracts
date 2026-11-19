@@ -28,6 +28,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from check_errors import check_error_tables
+
 ROOT = Path(__file__).resolve().parent.parent
 DOCS = ROOT / "docs" / "CONTRACTS.md"
 CONTRACTS_DIR = ROOT / "contracts"
@@ -344,66 +346,6 @@ def parse_doc_functions(text: str) -> tuple[dict[str, FunctionSpec], list[str]]:
     return functions, duplicates
 
 
-def extract_rust_error_codes(path: Path) -> dict[str, int]:
-    """Return ``{variant: value}`` for the ``#[contracterror]`` enum in *path*.
-
-    Only variants with an explicit numeric discriminant are captured; the
-    ``#[contracterror]`` attribute is used to locate the enum so unrelated
-    enums in the same file are ignored.
-    """
-    text = path.read_text(encoding="utf-8")
-    codes: dict[str, int] = {}
-
-    # Find the enum that follows a #[contracterror] attribute.
-    m_attr = re.search(r'#\[contracterror\]', text)
-    if not m_attr:
-        return codes
-
-    m_enum = re.search(r'\benum\s+[A-Za-z0-9_]+\s*\{', text[m_attr.end():])
-    if not m_enum:
-        return codes
-
-    body_start = m_attr.end() + m_enum.end()
-    depth = 1
-    i = body_start
-    while i < len(text) and depth > 0:
-        if text[i] == '{':
-            depth += 1
-        elif text[i] == '}':
-            depth -= 1
-        i += 1
-    body = text[body_start:i - 1]
-
-    for line in body.splitlines():
-        m = _RE_RUST_ERROR_VARIANT.match(line)
-        if m:
-            codes[m.group(1)] = int(m.group(2))
-
-    return codes
-
-
-def extract_docs_error_codes(path: Path) -> dict[str, int]:
-    """Return ``{variant: value}`` from the shared error-code table in *path*.
-
-    The shared table is the one under the ``### Error codes`` heading (or any
-    heading containing ``Error``) that lists ``| `Variant` | N |`` rows.
-    """
-    codes: dict[str, int] = {}
-    in_error_table = False
-
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if re.match(r"^#{1,6}\s", line):
-            in_error_table = bool(re.search(r"error", line, re.IGNORECASE))
-            continue
-
-        if in_error_table:
-            m = _RE_DOCS_ERROR_ROW.search(line)
-            if m:
-                codes[m.group(1)] = int(m.group(2))
-
-    return codes
-
-
 # ---------------------------------------------------------------------------
 # Comparison
 # ---------------------------------------------------------------------------
@@ -497,22 +439,8 @@ def main() -> int:
     errors.extend(compare(source_events, doc_events))
     errors.extend(compare_functions(source_fns, doc_fns))
 
-    # Cross-reference documented error codes against the Rust enums.
-    docs_error_codes = extract_docs_error_codes(CONTRACTS_MD)
-    for slug, src_path in CONTRACT_MAP.items():
-        if not src_path.exists():
-            continue
-
-        rust_codes = extract_rust_error_codes(src_path)
-        for variant, value in sorted(rust_codes.items()):
-            if variant not in docs_error_codes:
-                continue
-            documented = docs_error_codes[variant]
-            if documented != value:
-                errors.append(
-                    f"[{slug}] error code `{variant}` is documented as "
-                    f"{documented} in docs/CONTRACTS.md but the enum defines {value}"
-                )
+    # Cross-reference each contract's documented error codes against its enum.
+    errors.extend(check_error_tables())
 
     if errors:
         for err in errors:
@@ -528,3 +456,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
