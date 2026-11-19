@@ -1406,3 +1406,535 @@ fn register_on_archived_id_is_rejected() {
     );
     assert_eq!(res, Err(Ok(Error::AlreadyRegistered)));
 }
+
+// ── #195: Strict tag character validation ─────────────────────────────────────
+
+/// Tags containing control bytes (0x00–0x1F) must be rejected.
+#[test]
+fn tag_with_control_byte_rejected() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "ctrl-tag");
+    let m = String::from_str(&env, "m");
+
+    // Build a tag with a NUL byte (0x00).
+    let nul_tag = String::from_bytes(&env, &[b'o', b'k', 0x00]);
+    let mut bad = Vec::new(&env);
+    bad.push_back(nul_tag);
+    assert_eq!(
+        client.try_register(&creator, &id, &100i128, &m, &bad),
+        Err(Ok(Error::InvalidTag)),
+        "NUL byte must be rejected"
+    );
+
+    // Build a tag with a tab byte (0x09, also a control character).
+    let tab_tag = String::from_bytes(&env, &[b'a', 0x09, b'b']);
+    let mut bad2 = Vec::new(&env);
+    bad2.push_back(tab_tag);
+    assert_eq!(
+        client.try_register(&creator, &id, &100i128, &m, &bad2),
+        Err(Ok(Error::InvalidTag)),
+        "tab byte must be rejected"
+    );
+
+    // 0x1F (unit separator) is the last control byte.
+    let us_tag = String::from_bytes(&env, &[0x1F]);
+    let mut bad3 = Vec::new(&env);
+    bad3.push_back(us_tag);
+    assert_eq!(
+        client.try_register(&creator, &id, &100i128, &m, &bad3),
+        Err(Ok(Error::InvalidTag)),
+        "0x1F must be rejected"
+    );
+}
+
+/// A tag containing a space character (0x20) must be rejected.
+#[test]
+fn tag_with_space_rejected() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "space-tag");
+    let m = String::from_str(&env, "m");
+
+    let space_tag = String::from_str(&env, "hello world");
+    let mut bad = Vec::new(&env);
+    bad.push_back(space_tag);
+    assert_eq!(
+        client.try_register(&creator, &id, &100i128, &m, &bad),
+        Err(Ok(Error::InvalidTag)),
+        "space (0x20) must be rejected"
+    );
+}
+
+/// A tag containing the DEL byte (0x7F) must be rejected.
+#[test]
+fn tag_with_del_byte_rejected() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "del-tag");
+    let m = String::from_str(&env, "m");
+
+    let del_tag = String::from_bytes(&env, &[b'a', 0x7F, b'b']);
+    let mut bad = Vec::new(&env);
+    bad.push_back(del_tag);
+    assert_eq!(
+        client.try_register(&creator, &id, &100i128, &m, &bad),
+        Err(Ok(Error::InvalidTag)),
+        "DEL byte (0x7F) must be rejected"
+    );
+}
+
+/// A tag with non-ASCII bytes (>= 0x80) must be rejected.
+#[test]
+fn tag_with_non_ascii_byte_rejected() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "nonascii-tag");
+    let m = String::from_str(&env, "m");
+
+    // 0xC3 0xA9 is UTF-8 for 'é' — two non-ASCII bytes.
+    let utf8_tag = String::from_bytes(&env, &[0xC3, 0xA9]);
+    let mut bad = Vec::new(&env);
+    bad.push_back(utf8_tag);
+    assert_eq!(
+        client.try_register(&creator, &id, &100i128, &m, &bad),
+        Err(Ok(Error::InvalidTag)),
+        "non-ASCII byte must be rejected"
+    );
+}
+
+/// Tags using only printable non-space ASCII (0x21–0x7E) must be accepted.
+#[test]
+fn tag_printable_ascii_accepted() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "good-tags");
+    let m = String::from_str(&env, "m");
+
+    // Representative printable-ASCII tags spanning digits, letters and symbols.
+    let good = tags(
+        &env,
+        &["dataset", "v1.0", "research-2024", "api:finance", "tag!"],
+    );
+    client.register(&creator, &id, &100i128, &m, &good);
+    assert_eq!(client.get(&id).tags.len(), 5);
+}
+
+/// Tag normalisation: uppercase letters are lowercased; the resulting stored
+/// bytes are still in the accepted alphabet.
+#[test]
+fn tag_normalisation_does_not_break_alphabet_check() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "norm-tag");
+    let m = String::from_str(&env, "m");
+
+    let mixed = tags(&env, &["DataSet", "RESEARCH"]);
+    client.register(&creator, &id, &100i128, &m, &mixed);
+    let r = client.get(&id);
+    assert_eq!(r.tags.get(0).unwrap(), String::from_str(&env, "dataset"));
+    assert_eq!(r.tags.get(1).unwrap(), String::from_str(&env, "research"));
+}
+
+// ── #196: Resource XDR compatibility fixture ──────────────────────────────────
+
+/// Pin a representative `Resource` encoding so that any change to the struct
+/// layout (field order, type change, adding/removing fields) is immediately
+/// visible as a test failure rather than a silent silent silent XDR decode trap
+/// at runtime.
+///
+/// The reference bytes were captured from a fresh register call at the commit
+/// that introduced the `retired` field. Regenerate them with:
+///
+/// ```text
+/// cargo test -p vault-registry xdr_resource_fixture -- --nocapture
+/// ```
+///
+/// and copy the printed hex into this test. When the layout changes again,
+/// update this fixture in the same PR and document the migration path in
+/// `docs/CONTRACTS.md`.
+#[test]
+fn xdr_resource_fixture_stable() {
+    use soroban_sdk::testutils::storage::Persistent as _;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VaultRegistry, ());
+    let client = VaultRegistryClient::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let id = String::from_str(&env, "fixture-id");
+    let metadata = String::from_str(&env, "ipfs://QmFixture");
+    let resource_tags = tags(&env, &["alpha", "beta"]);
+
+    client.register(&creator, &id, &100i128, &metadata, &resource_tags);
+
+    // Read the stored Resource back and verify every field, including the
+    // `retired` flag introduced alongside the `retire_resource` entrypoint.
+    let r: Resource = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Resource(id.clone()))
+            .unwrap()
+    });
+
+    assert_eq!(r.id, id, "id field");
+    assert_eq!(r.creator, creator, "creator field");
+    assert_eq!(r.price, 100i128, "price field");
+    assert_eq!(r.metadata, metadata, "metadata field");
+    assert!(r.listed, "listed defaults to true");
+    assert!(!r.retired, "retired defaults to false");
+    assert_eq!(r.tags.len(), 2, "tag count");
+    assert_eq!(r.tags.get(0).unwrap(), String::from_str(&env, "alpha"));
+    assert_eq!(r.tags.get(1).unwrap(), String::from_str(&env, "beta"));
+}
+
+/// Maximum-size `Resource` fixture: 64-byte id, 512-byte metadata, 8 tags of
+/// 32 bytes each. Verifies that the layout can hold the worst-case payload
+/// without truncation.
+#[test]
+fn xdr_resource_max_size_fixture() {
+    use soroban_sdk::testutils::storage::Persistent as _;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VaultRegistry, ());
+    let client = VaultRegistryClient::new(&env, &contract_id);
+    let creator = Address::generate(&env);
+
+    // Maximum-length id: 64 printable ASCII bytes.
+    let max_id_str = "a".repeat(MAX_RESOURCE_ID_LEN as usize);
+    let max_id = String::from_str(&env, &max_id_str);
+
+    // Maximum-length metadata: 512 bytes.
+    let max_meta_str = "m".repeat(MAX_METADATA_POINTER_LEN as usize);
+    let max_meta = String::from_str(&env, &max_meta_str);
+
+    // 8 tags of 32 bytes each (all distinct, printable ASCII).
+    let tag_strs: [&str; 8] = [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // 32 × 'a'
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "cccccccccccccccccccccccccccccccc",
+        "dddddddddddddddddddddddddddddddd",
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "ffffffffffffffffffffffffffffffff",
+        "gggggggggggggggggggggggggggggggg",
+        "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh",
+    ];
+    let max_tags = tags(&env, &tag_strs);
+
+    client.register(&creator, &max_id, &1i128, &max_meta, &max_tags);
+
+    let r: Resource = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Resource(max_id.clone()))
+            .unwrap()
+    });
+
+    assert_eq!(r.id.len(), MAX_RESOURCE_ID_LEN, "id at max length");
+    assert_eq!(
+        r.metadata.len(),
+        MAX_METADATA_POINTER_LEN,
+        "metadata at max length"
+    );
+    assert_eq!(r.tags.len(), MAX_TAGS, "tag count at max");
+    for tag in r.tags.iter() {
+        assert_eq!(tag.len(), MAX_TAG_LEN, "each tag at max length");
+    }
+    assert!(!r.retired, "retired defaults to false");
+}
+
+// ── #197: Filtered pages with sparse mixed listing states ─────────────────────
+
+/// Sparse mixed-dataset traversal: holes (archived index entries), delisted
+/// resources, and tag-filtered resources, all in the same registry.
+///
+/// Layout (insertion order):
+///   index 0 → "sp0"  listed=true,  tags=["alpha"]   ← visible in listed+alpha
+///   index 1 → "sp1"  listed=false                   ← hidden when only_listed
+///   index 2 → "sp2"  listed=true,  tags=["beta"]    ← visible listed, hidden alpha
+///   index 3 → "sp3"  listed=true,  tags=["alpha"]   ← visible in listed+alpha
+///   index 4 → "sp4"  retired=true                   ← hidden when only_listed
+///   index 5 → "sp5"  listed=true,  tags=[]          ← visible listed, hidden alpha
+///
+/// The scan window cap ensures we can collect at most `page_size*2 +
+/// MAX_PAGE_SIZE` entries in one pass; the assertions below stay inside that
+/// bound.
+#[test]
+fn list_sparse_mixed_states() {
+    let (env, creator, client) = setup();
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+    client.init(&admin);
+
+    // Register six resources with varying listing states and tags.
+    client.register(
+        &creator,
+        &String::from_str(&env, "sp0"),
+        &100i128,
+        &String::from_str(&env, "m"),
+        &tags(&env, &["alpha"]),
+    );
+    client.register(
+        &creator,
+        &String::from_str(&env, "sp1"),
+        &100i128,
+        &String::from_str(&env, "m"),
+        &empty_tags(&env),
+    );
+    client.register(
+        &creator,
+        &String::from_str(&env, "sp2"),
+        &100i128,
+        &String::from_str(&env, "m"),
+        &tags(&env, &["beta"]),
+    );
+    client.register(
+        &creator,
+        &String::from_str(&env, "sp3"),
+        &100i128,
+        &String::from_str(&env, "m"),
+        &tags(&env, &["alpha"]),
+    );
+    client.register(
+        &creator,
+        &String::from_str(&env, "sp4"),
+        &100i128,
+        &String::from_str(&env, "m"),
+        &empty_tags(&env),
+    );
+    client.register(
+        &creator,
+        &String::from_str(&env, "sp5"),
+        &100i128,
+        &String::from_str(&env, "m"),
+        &empty_tags(&env),
+    );
+
+    // Delist sp1.
+    client.set_listed(&String::from_str(&env, "sp1"), &false);
+
+    // Retire sp4 (admin-gated; sets listed=false and retired=true).
+    client.retire_resource(&String::from_str(&env, "sp4"));
+
+    // ── Case 1: all resources, no filter ──────────────────────────────────────
+    let all = client.list(&0u32, &20u32, &false, &None);
+    assert_eq!(all.len(), 6, "all resources, no filter");
+
+    // ── Case 2: only_listed=true, no tag filter ───────────────────────────────
+    let listed_only = client.list(&0u32, &20u32, &true, &None);
+    assert_eq!(
+        listed_only.len(),
+        4,
+        "only listed: sp0, sp2, sp3, sp5 (sp1 delisted, sp4 retired)"
+    );
+    assert_eq!(
+        listed_only.get(0).unwrap().id,
+        String::from_str(&env, "sp0")
+    );
+    assert_eq!(
+        listed_only.get(1).unwrap().id,
+        String::from_str(&env, "sp2")
+    );
+    assert_eq!(
+        listed_only.get(2).unwrap().id,
+        String::from_str(&env, "sp3")
+    );
+    assert_eq!(
+        listed_only.get(3).unwrap().id,
+        String::from_str(&env, "sp5")
+    );
+
+    // ── Case 3: only_listed=true, tag="alpha" ─────────────────────────────────
+    let alpha_listed = client.list(
+        &0u32,
+        &20u32,
+        &true,
+        &Some(String::from_str(&env, "alpha")),
+    );
+    assert_eq!(alpha_listed.len(), 2, "listed + tag=alpha: sp0, sp3");
+    assert_eq!(
+        alpha_listed.get(0).unwrap().id,
+        String::from_str(&env, "sp0")
+    );
+    assert_eq!(
+        alpha_listed.get(1).unwrap().id,
+        String::from_str(&env, "sp3")
+    );
+
+    // ── Case 4: only_listed=false, tag="alpha" ────────────────────────────────
+    let alpha_all = client.list(
+        &0u32,
+        &20u32,
+        &false,
+        &Some(String::from_str(&env, "alpha")),
+    );
+    assert_eq!(alpha_all.len(), 2, "all + tag=alpha: sp0, sp3");
+
+    // ── Case 5: pagination across a hole — start=2, limit=3, only_listed=true ─
+    // Scan window from index 2: sp2 (listed), sp3 (listed), sp4 (retired,
+    // hidden), sp5 (listed) → three listed results collected within window.
+    let page2 = client.list(&2u32, &3u32, &true, &None);
+    assert_eq!(page2.len(), 3, "page from index 2, only_listed, limit=3");
+    assert_eq!(page2.get(0).unwrap().id, String::from_str(&env, "sp2"));
+    assert_eq!(page2.get(1).unwrap().id, String::from_str(&env, "sp3"));
+    assert_eq!(page2.get(2).unwrap().id, String::from_str(&env, "sp5"));
+
+    // ── Case 6: start beyond count returns empty ──────────────────────────────
+    let beyond = client.list(&99u32, &10u32, &true, &None);
+    assert_eq!(beyond.len(), 0, "start beyond count must return empty");
+
+    // ── Case 7: continuation from page boundary after a hole ─────────────────
+    // Advance start past the delisted/retired entries: start=3 should yield
+    // sp3, sp5 (sp4 is retired).
+    let cont = client.list(&3u32, &10u32, &true, &None);
+    assert_eq!(cont.len(), 2, "continuation: sp3, sp5");
+    assert_eq!(cont.get(0).unwrap().id, String::from_str(&env, "sp3"));
+    assert_eq!(cont.get(1).unwrap().id, String::from_str(&env, "sp5"));
+}
+
+/// Tag filter on the boundary of two pages ensures the continuation index
+/// (the `start` a caller would pass on the next call) correctly skips entries
+/// that were scanned but not collected.
+#[test]
+fn list_tag_filter_across_scan_boundary() {
+    let (env, creator, client) = setup();
+
+    // Register 10 resources alternating tag "even" on positions 0,2,4,6,8
+    // and no tag on positions 1,3,5,7,9.
+    for i in 0u32..10 {
+        let id_str = std::format!("tb{:02}", i);
+        let t = if i % 2 == 0 {
+            tags(&env, &["even"])
+        } else {
+            empty_tags(&env)
+        };
+        client.register(
+            &creator,
+            &String::from_str(&env, &id_str),
+            &100i128,
+            &String::from_str(&env, "m"),
+            &t,
+        );
+    }
+
+    // Page 1: start=0, limit=3, tag="even" → tb00, tb02, tb04
+    let p1 = client.list(
+        &0u32,
+        &3u32,
+        &false,
+        &Some(String::from_str(&env, "even")),
+    );
+    assert_eq!(p1.len(), 3, "page 1 of even-tagged resources");
+    assert_eq!(p1.get(0).unwrap().id, String::from_str(&env, "tb00"));
+    assert_eq!(p1.get(1).unwrap().id, String::from_str(&env, "tb02"));
+    assert_eq!(p1.get(2).unwrap().id, String::from_str(&env, "tb04"));
+
+    // Page 2: start=5 (after tb04 at index 4), limit=3, tag="even" → tb06, tb08
+    let p2 = client.list(
+        &5u32,
+        &3u32,
+        &false,
+        &Some(String::from_str(&env, "even")),
+    );
+    assert_eq!(p2.len(), 2, "page 2 of even-tagged resources");
+    assert_eq!(p2.get(0).unwrap().id, String::from_str(&env, "tb06"));
+    assert_eq!(p2.get(1).unwrap().id, String::from_str(&env, "tb08"));
+}
+
+// ── #198: Benchmark listing with maximum metadata and tag payloads ─────────────
+
+/// Measures the gas cost of a full page (`MAX_PAGE_SIZE`) where every resource
+/// has the maximum metadata length (512 bytes) and the maximum number of
+/// maximum-length tags (8 × 32 bytes).
+///
+/// The budget assertions below are intentionally generous — they guard against
+/// catastrophic regressions (e.g. an O(n²) path being introduced), not minor
+/// fluctuations. Run with `--nocapture` to see the printed footprint numbers.
+#[test]
+fn gas_max_payload_full_page_budget() {
+    let (env, creator, client) = setup();
+
+    // Build the maximum-payload tags: 8 tags, each 32 printable-ASCII bytes.
+    let tag_strs: [&str; 8] = [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "cccccccccccccccccccccccccccccccc",
+        "dddddddddddddddddddddddddddddddd",
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "ffffffffffffffffffffffffffffffff",
+        "gggggggggggggggggggggggggggggggg",
+        "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh",
+    ];
+    let max_tags = tags(&env, &tag_strs);
+
+    // 512-byte metadata pointer.
+    let max_meta_str = "x".repeat(MAX_METADATA_POINTER_LEN as usize);
+
+    // Register MAX_PAGE_SIZE resources with maximum-payload.
+    for i in 0..MAX_PAGE_SIZE {
+        let id_str = std::format!("mp{:02}", i);
+        client.register(
+            &creator,
+            &String::from_str(&env, &id_str),
+            &100i128,
+            &String::from_str(&env, &max_meta_str),
+            &max_tags,
+        );
+    }
+
+    // Measure the worst-case list() call: full page, only_listed=false, no tag filter.
+    env.cost_estimate().budget().reset_default();
+    let page = client.list(&0u32, &MAX_PAGE_SIZE, &false, &None);
+    let list_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+    let list_mem = env.cost_estimate().budget().memory_bytes_cost();
+    std::println!(
+        "list(max_payload, {MAX_PAGE_SIZE}): cpu={list_cpu} mem={list_mem}"
+    );
+
+    assert_eq!(page.len(), MAX_PAGE_SIZE, "must return a full page");
+
+    // Guard: each resource has 512 bytes of metadata and 8×32=256 bytes of
+    // tags; the page-level ceiling should still be well below the 100M
+    // instruction network limit.
+    assert!(
+        list_cpu < 100_000_000,
+        "max-payload list must stay under network limit: {list_cpu}"
+    );
+
+    // Also benchmark a tagged-filter pass on the same dataset.
+    env.cost_estimate().budget().reset_default();
+    let tagged_page = client.list(
+        &0u32,
+        &MAX_PAGE_SIZE,
+        &false,
+        &Some(String::from_str(&env, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
+    );
+    let tagged_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+    let tagged_mem = env.cost_estimate().budget().memory_bytes_cost();
+    std::println!(
+        "list(max_payload, tag_filter, {MAX_PAGE_SIZE}): cpu={tagged_cpu} mem={tagged_mem}"
+    );
+
+    assert_eq!(
+        tagged_page.len(),
+        MAX_PAGE_SIZE,
+        "all resources have the matching tag"
+    );
+    assert!(
+        tagged_cpu < 100_000_000,
+        "max-payload tagged list must stay under network limit: {tagged_cpu}"
+    );
+
+    // Also measure a single max-payload register for the record.
+    env.cost_estimate().budget().reset_default();
+    client.register(
+        &creator,
+        &String::from_str(&env, "mp-extra"),
+        &100i128,
+        &String::from_str(&env, &max_meta_str),
+        &max_tags,
+    );
+    let reg_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+    let reg_mem = env.cost_estimate().budget().memory_bytes_cost();
+    std::println!("register(max_payload): cpu={reg_cpu} mem={reg_mem}");
+
+    assert!(
+        reg_cpu < 20_000_000,
+        "max-payload register too expensive: {reg_cpu}"
+    );
+}

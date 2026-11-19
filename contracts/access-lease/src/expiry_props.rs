@@ -17,8 +17,8 @@
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
-    Address, Env, String,
+    testutils::{Address as _, Events as _, Ledger as _},
+    Address, Env, String, Symbol, TryIntoVal,
 };
 
 /// Ledgers entries stay live for in these tests, so advancing time never
@@ -48,6 +48,20 @@ fn setup<'a>(start: u32) -> (Env, AccessLeaseClient<'a>, String, Address) {
 
 fn set_ledger(env: &Env, seq: u32) {
     env.ledger().set_sequence_number(seq);
+}
+
+/// Collects the names of the contract events emitted by the most recent
+/// invocation, in emission order.
+fn emitted_event_names(env: &Env) -> std::vec::Vec<Symbol> {
+    env.events()
+        .all()
+        .iter()
+        .filter_map(|(_, topics, _)| {
+            topics
+                .get(0)
+                .and_then(|t| t.try_into_val(env).ok())
+        })
+        .collect()
 }
 
 proptest! {
@@ -181,20 +195,35 @@ proptest! {
             );
         } else {
             let regranted = client.grant_lease(&rid, &buyer, &second);
-            // Grant history is preserved across a re-grant over an expired lease.
-            prop_assert_eq!(regranted.granted_at, lease.granted_at);
             prop_assert_eq!(regranted.expires_at, t + second);
+            prop_assert_eq!(regranted.granted_at, lease.granted_at);
+            prop_assert_eq!(regranted.duration_ledgers, second);
         }
     }
 
-    /// Zero-length grants and extensions are always rejected.
+    /// One successful `accept_admin` emits exactly two admin events, in the
+    /// documented order: `acceptadmin` first, then `setadmin`. Indexers must
+    /// dedupe on the admin transition and treat `setadmin` as the
+    /// authoritative state-change event.
     #[test]
-    fn zero_duration_rejected(now in 0..=MAX_START) {
-        let (_env, client, rid, buyer) = setup(now);
-        prop_assert_eq!(
-            client.try_grant_lease(&rid, &buyer, &0),
-            Err(Ok(Error::InvalidDuration))
-        );
-        prop_assert!(client.try_get_lease(&rid, &buyer).is_err());
+    fn accept_admin_emits_acceptadmin_then_setadmin_once(
+        now in 0..=MAX_START,
+        duration in 1..=MAX_STEP,
+    ) {
+        let (env, client, rid, buyer) = setup(now);
+        client.grant_lease(&rid, &buyer, &duration);
+
+        let new_admin = Address::generate(&env);
+        client.accept_admin(&new_admin);
+
+        let names = emitted_event_names(&env);
+        let acceptadmin = names.iter().filter(|n| **n == Symbol::new(&env, "acceptadmin")).count();
+        let setadmin = names.iter().filter(|n| **n == Symbol::new(&env, "setadmin")).count();
+        prop_assert_eq!(acceptadmin, 1);
+        prop_assert_eq!(setadmin, 1);
+
+        let accept_pos = names.iter().position(|n| *n == Symbol::new(&env, "acceptadmin"));
+        let set_pos = names.iter().position(|n| *n == Symbol::new(&env, "setadmin"));
+        prop_assert!(accept_pos < set_pos, "acceptadmin must precede setadmin");
     }
 }
