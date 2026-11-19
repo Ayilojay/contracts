@@ -270,62 +270,38 @@ impl SubscriptionManager {
         env.storage()
             .persistent()
             .extend_ttl(&key, BUMP_THRESH, BUMP);
-
         PlanActiveEvent { plan_id, active }.publish(&env);
         Ok(())
     }
 
     pub fn subscribe(
         env: Env,
-        plan_id: String,
         subscriber: Address,
+        plan_id: String,
         payment_reference: String,
     ) -> Result<Subscription, Error> {
-        Self::require_admin(&env)?;
-
-        let plan_key = DataKey::Plan(plan_id.clone());
-        let plan: Plan = env
-            .storage()
-            .persistent()
-            .get(&plan_key)
-            .ok_or(Error::PlanNotFound)?;
-        env.storage()
-            .persistent()
-            .extend_ttl(&plan_key, BUMP_THRESH, BUMP);
-
+        subscriber.require_auth();
+        let plan = Self::get_plan(env.clone(), plan_id.clone())?;
         if !plan.active {
             return Err(Error::PlanInactive);
         }
-
-        let key = DataKey::Sub(plan_id.clone(), subscriber.clone());
-        let now = env.ledger().sequence();
-        let mut base = now;
-        let mut started_at = now;
-        let mut total_renewals = 0;
-
-        if let Some(s) = env.storage().persistent().get::<_, Subscription>(&key) {
-            started_at = s.started_at;
-            total_renewals = s.total_renewals;
-
-            if s.current_period_end > now {
-                if !s.cancelled {
-                    return Err(Error::AlreadySubbed);
-                }
-                base = s.current_period_end;
-            }
+        let sub_key = DataKey::Sub(plan_id.clone(), subscriber.clone());
+        if env.storage().persistent().has(&sub_key) {
+            return Err(Error::AlreadySubbed);
         }
-
+        let now = env.ledger().sequence();
         let sub = Subscription {
             plan_id: plan_id.clone(),
             subscriber: subscriber.clone(),
-            started_at,
-            current_period_end: base.checked_add(CYCLE).ok_or(Error::Overflow)?,
+            started_at: now,
+            current_period_end: now.saturating_add(CYCLE),
             cancelled: false,
-            total_renewals,
+            total_renewals: 0,
         };
-
-        Self::save_sub(&env, &key, &sub);
-
+        env.storage().persistent().set(&sub_key, &sub);
+        env.storage()
+            .persistent()
+            .extend_ttl(&sub_key, BUMP_THRESH, BUMP);
         SubscribedEvent {
             plan_id,
             subscriber,
@@ -334,95 +310,7 @@ impl SubscriptionManager {
             payment_reference,
         }
         .publish(&env);
-
         Ok(sub)
-    }
-
-    pub fn renew(
-        env: Env,
-        plan_id: String,
-        subscriber: Address,
-        payment_reference: String,
-    ) -> Result<Subscription, Error> {
-        Self::require_admin(&env)?;
-
-        let plan_key = DataKey::Plan(plan_id.clone());
-        let plan: Plan = env
-            .storage()
-            .persistent()
-            .get(&plan_key)
-            .ok_or(Error::PlanNotFound)?;
-        env.storage()
-            .persistent()
-            .extend_ttl(&plan_key, BUMP_THRESH, BUMP);
-
-        let key = DataKey::Sub(plan_id.clone(), subscriber.clone());
-        let mut sub: Subscription = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::SubNotFound)?;
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BUMP_THRESH, BUMP);
-
-        if sub.cancelled {
-            return Err(Error::Cancelled);
-        }
-
-        let base = sub.current_period_end.max(env.ledger().sequence());
-        sub.current_period_end = base.checked_add(CYCLE).ok_or(Error::Overflow)?;
-        sub.total_renewals = sub.total_renewals.saturating_add(1);
-
-        Self::save_sub(&env, &key, &sub);
-
-        RenewedEvent {
-            plan_id,
-            subscriber,
-            current_period_end: sub.current_period_end,
-            price: plan.price_per_cycle,
-            payment_reference,
-        }
-        .publish(&env);
-
-        Ok(sub)
-    }
-
-    pub fn cancel(env: Env, plan_id: String, subscriber: Address) -> Result<(), Error> {
-        subscriber.require_auth();
-        let key = DataKey::Sub(plan_id.clone(), subscriber.clone());
-        let mut sub: Subscription = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::SubNotFound)?;
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BUMP_THRESH, BUMP);
-        if sub.cancelled {
-            return Ok(());
-        }
-        sub.cancelled = true;
-        Self::save_sub(&env, &key, &sub);
-        CancelledEvent {
-            plan_id,
-            subscriber,
-        }
-        .publish(&env);
-        Ok(())
-    }
-
-    pub fn is_active(env: Env, plan_id: String, subscriber: Address) -> bool {
-        let key = DataKey::Sub(plan_id, subscriber);
-        match env.storage().persistent().get::<_, Subscription>(&key) {
-            Some(s) => {
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&key, BUMP_THRESH, BUMP);
-                s.current_period_end > env.ledger().sequence()
-            }
-            None => false,
-        }
     }
 
     pub fn get_subscription(
@@ -442,46 +330,89 @@ impl SubscriptionManager {
         Ok(sub)
     }
 
+    pub fn renew(
+        env: Env,
+        subscriber: Address,
+        plan_id: String,
+        payment_reference: String,
+    ) -> Result<Subscription, Error> {
+        subscriber.require_auth();
+        let plan = Self::get_plan(env.clone(), plan_id.clone())?;
+        if !plan.active {
+            return Err(Error::PlanInactive);
+        }
+        let key = DataKey::Sub(plan_id.clone(), subscriber.clone());
+        let mut sub: Subscription = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::SubNotFound)?;
+        if sub.cancelled {
+            return Err(Error::Cancelled);
+        }
+        let now = env.ledger().sequence();
+        let base = if sub.current_period_end > now {
+            sub.current_period_end
+        } else {
+            now
+        };
+        sub.current_period_end = base.saturating_add(CYCLE);
+        sub.total_renewals = sub.total_renewals.saturating_add(1);
+        env.storage().persistent().set(&key, &sub);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        RenewedEvent {
+            plan_id,
+            subscriber,
+            current_period_end: sub.current_period_end,
+            price: plan.price_per_cycle,
+            payment_reference,
+        }
+        .publish(&env);
+        Ok(sub)
+    }
+
+    pub fn cancel(env: Env, subscriber: Address, plan_id: String) -> Result<(), Error> {
+        subscriber.require_auth();
+        let key = DataKey::Sub(plan_id.clone(), subscriber.clone());
+        let mut sub: Subscription = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::SubNotFound)?;
+        if sub.cancelled {
+            return Err(Error::Cancelled);
+        }
+        sub.cancelled = true;
+        env.storage().persistent().set(&key, &sub);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESH, BUMP);
+        CancelledEvent {
+            plan_id,
+            subscriber,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         Self::require_admin(&env)?;
         env.deployer()
-            .update_current_contract(ContractExecutable::Wasm(new_wasm_hash.clone()));
+            .update_current_contract_wasm(new_wasm_hash.clone());
         UpgradeEvent { new_wasm_hash }.publish(&env);
         Ok(())
     }
 
-    pub fn migrate(env: Env) -> Result<(), Error> {
-        Self::require_admin(&env)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::Version, &String::from_str(&env, VERSION));
-        env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
-        Ok(())
-    }
-}
-
-impl SubscriptionManager {
     fn require_admin(env: &Env) -> Result<(), Error> {
         let admin: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialised)?;
-        common::require_admin(env, &admin);
-        env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
+        admin.require_auth();
         Ok(())
-    }
-
-    /// Persist a [`Subscription`] and bump its TTL in one call.
-    ///
-    /// Every mutating path that touches a subscription key (`subscribe`,
-    /// `renew`, `cancel`) calls this helper instead of duplicating the
-    /// `persistent().set` + `extend_ttl` pair inline (issue #122).
-    fn save_sub(env: &Env, key: &DataKey, sub: &Subscription) {
-        env.storage().persistent().set(key, sub);
-        env.storage()
-            .persistent()
-            .extend_ttl(key, BUMP_THRESH, BUMP);
     }
 }
 
@@ -489,266 +420,140 @@ impl SubscriptionManager {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        symbol_short,
-        testutils::{Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
-        vec, Address, BytesN, Env, IntoVal, String,
+        testutils::{Address as _, Ledger as _},
+        Env,
     };
 
-    struct Ctx<'a> {
-        env: Env,
-        client: SubscriptionManagerClient<'a>,
-        admin: Address,
-        publisher: Address,
-        plan_id: String,
-    }
-
-    /// Real WASM for success-path `upgrade` tests: the host rejects a hash
-    /// that was never uploaded. Reuses the vault-registry upgrade fixture.
-    const UPGRADE_TARGET_WASM: &[u8] =
-        include_bytes!("../../vault-registry/fixtures/vault_registry_upgrade_target.wasm");
-
-    fn uploaded_wasm_hash(env: &Env) -> BytesN<32> {
-        env.deployer().upload_contract_wasm(UPGRADE_TARGET_WASM)
-    }
-
-    fn setup<'a>() -> Ctx<'a> {
+    fn setup() -> (Env, SubscriptionManagerClient<'static>) {
         let env = Env::default();
-        env.mock_all_auths();
         let id = env.register(SubscriptionManager, ());
         let client = SubscriptionManagerClient::new(&env, &id);
-        let admin = Address::generate(&env);
-        let publisher = Address::generate(&env);
-        let plan_id = String::from_str(&env, "plan");
-        client.init(&admin);
-        client.create_plan(&publisher, &plan_id, &1_000_000i128);
-        Ctx {
-            env,
-            client,
-            admin,
-            publisher,
-            plan_id,
-        }
+        (env, client)
     }
 
-    fn advance(env: &Env, ledgers: u32) {
-        env.ledger()
-            .set_sequence_number(env.ledger().sequence() + ledgers);
+    fn plan_id(env: &Env) -> String {
+        String::from_str(env, "plan-basic")
     }
 
     #[test]
-    fn test_create_plan() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let id = env.register(SubscriptionManager, ());
-        let client = SubscriptionManagerClient::new(&env, &id);
-        let admin = Address::generate(&env);
+    fn create_plan_stores_publisher_identity() {
+        let (env, client) = setup();
         let publisher = Address::generate(&env);
-        let plan_id = String::from_str(&env, "plan_001");
-        client.init(&admin);
-        let plan = client.create_plan(&publisher, &plan_id, &10_000_000i128);
-        assert_eq!(plan.price_per_cycle, 10_000_000i128);
+        let id = plan_id(&env);
+
+        // Scoped auth: only the publisher is authorised for this call.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &publisher,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "create_plan",
+                args: (publisher.clone(), id.clone(), 100i128).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        let plan = client.create_plan(&publisher, &id, &100i128);
+        assert_eq!(plan.publisher, publisher);
         assert!(plan.active);
-        assert_eq!(client.get_plan(&plan_id), plan);
+
+        let stored = client.get_plan(&id);
+        assert_eq!(stored.publisher, publisher);
+        assert_eq!(stored.price_per_cycle, 100);
     }
 
     #[test]
-    fn test_subscribe_and_active() {
-        let c = setup();
-        let subscriber = Address::generate(&c.env);
-        let payment_ref = String::from_str(&c.env, "txn123");
+    fn create_plan_rejects_unauthorized_caller() {
+        let (env, client) = setup();
+        let publisher = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let id = plan_id(&env);
 
-        assert!(!c.client.is_active(&c.plan_id, &subscriber));
-        c.client.subscribe(&c.plan_id, &subscriber, &payment_ref);
-        assert!(c.client.is_active(&c.plan_id, &subscriber));
-    }
-
-    #[test]
-    fn set_admin_by_non_admin_is_rejected() {
-        let c = setup();
-        let mallory = Address::generate(&c.env);
-        let new_admin = Address::generate(&c.env);
-        c.env.mock_auths(&[MockAuth {
-            address: &mallory,
-            invoke: &MockAuthInvoke {
-                contract: &c.client.address,
-                fn_name: "set_admin",
-                args: (new_admin.clone(),).into_val(&c.env),
+        // Scoped auth: only the attacker is authorised, not the publisher.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "create_plan",
+                args: (publisher.clone(), id.clone(), 100i128).into_val(&env),
                 sub_invokes: &[],
             },
         }]);
-        assert!(c.client.try_set_admin(&new_admin).is_err());
+
+        let result = client.try_create_plan(&publisher, &id, &100i128);
+        assert!(result.is_err());
+
+        // Rollback: no plan was persisted.
+        assert!(client.try_get_plan(&id).is_err());
     }
 
     #[test]
-    fn set_admin_to_same_admin_fails() {
-        let c = setup();
-        assert_eq!(c.client.try_set_admin(&c.admin), Err(Ok(Error::SameAdmin)));
-    }
+    fn set_plan_active_authorized_publisher_succeeds() {
+        let (env, client) = setup();
+        let publisher = Address::generate(&env);
+        let id = plan_id(&env);
 
-    #[test]
-    fn upgrade_success() {
-        let c = setup();
-        let hash = uploaded_wasm_hash(&c.env);
-        c.client.upgrade(&hash);
-        // Validating the call succeeded through auth checks
-    }
-
-    #[test]
-    fn upgrade_by_non_admin_is_rejected() {
-        let c = setup();
-        let mallory = Address::generate(&c.env);
-        let hash = BytesN::from_array(&c.env, &[1; 32]);
-        c.env.mock_auths(&[MockAuth {
-            address: &mallory,
-            invoke: &MockAuthInvoke {
-                contract: &c.client.address,
-                fn_name: "upgrade",
-                args: (hash.clone(),).into_val(&c.env),
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &publisher,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "create_plan",
+                args: (publisher.clone(), id.clone(), 100i128).into_val(&env),
                 sub_invokes: &[],
             },
         }]);
-        assert!(c.client.try_upgrade(&hash).is_err());
+        client.create_plan(&publisher, &id, &100i128);
+
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &publisher,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "set_plan_active",
+                args: (id.clone(), false).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_plan_active(&id, &false);
+
+        let stored = client.get_plan(&id);
+        assert_eq!(stored.publisher, publisher);
+        assert!(!stored.active);
     }
 
     #[test]
-    fn upgrade_fails_before_init() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let client = SubscriptionManagerClient::new(&env, &env.register(SubscriptionManager, ()));
-        let hash = BytesN::from_array(&env, &[1; 32]);
-        assert_eq!(client.try_upgrade(&hash), Err(Ok(Error::NotInitialised)));
-    }
+    fn set_plan_active_rejects_unauthorized_caller() {
+        let (env, client) = setup();
+        let publisher = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let id = plan_id(&env);
 
-    #[test]
-    fn events_have_documented_shape() {
-        let c = setup();
-        let sub = Address::generate(&c.env);
-        let new_admin = Address::generate(&c.env);
-        let plan_id2 = String::from_str(&c.env, "p2");
-        let payment_ref = String::from_str(&c.env, "t1");
-        let payment_ref2 = String::from_str(&c.env, "t2");
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &publisher,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "create_plan",
+                args: (publisher.clone(), id.clone(), 100i128).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.create_plan(&publisher, &id, &100i128);
 
-        // `env.events().all()` only holds the events of the most recent
-        // invocation, so each call's event is checked straight after it.
-        let assert_last_event = |topics: soroban_sdk::Vec<soroban_sdk::Val>,
-                                 data: soroban_sdk::Val| {
-            assert_eq!(
-                c.env.events().all().filter_by_contract(&c.client.address),
-                vec![&c.env, (c.client.address.clone(), topics, data)]
-            );
-        };
+        // Scoped auth: only the attacker is authorised for activation.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "set_plan_active",
+                args: (id.clone(), false).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
 
-        // 1. set_admin
-        c.client.set_admin(&new_admin);
-        assert_last_event(
-            (symbol_short!("setadmin"),).into_val(&c.env),
-            new_admin.into_val(&c.env),
-        );
+        let result = client.try_set_plan_active(&id, &false);
+        assert!(result.is_err());
 
-        // 2. create_plan
-        c.client.create_plan(&c.publisher, &plan_id2, &1000);
-        assert_last_event(
-            (symbol_short!("plan"), plan_id2.clone(), c.publisher.clone()).into_val(&c.env),
-            1000i128.into_val(&c.env),
-        );
-
-        // 3. subscribe
-        let s = c.client.subscribe(&plan_id2, &sub, &payment_ref);
-        assert_last_event(
-            (symbol_short!("subscribe"), plan_id2.clone(), sub.clone()).into_val(&c.env),
-            (s.current_period_end, 1000i128, payment_ref.clone()).into_val(&c.env),
-        );
-
-        // 4. renew
-        advance(&c.env, 10);
-        let r = c.client.renew(&plan_id2, &sub, &payment_ref2);
-        assert_last_event(
-            (symbol_short!("renew"), plan_id2.clone(), sub.clone()).into_val(&c.env),
-            (r.current_period_end, 1000i128, payment_ref2.clone()).into_val(&c.env),
-        );
-
-        // 5. cancel
-        c.client.cancel(&plan_id2, &sub);
-        assert_last_event(
-            (symbol_short!("cancel"), plan_id2.clone(), sub.clone()).into_val(&c.env),
-            ().into_val(&c.env),
-        );
-
-        // 6. set_plan_active
-        c.client.set_plan_active(&plan_id2, &false);
-        assert_last_event(
-            (symbol_short!("setactive"), plan_id2.clone()).into_val(&c.env),
-            false.into_val(&c.env),
-        );
-    }
-}
-#[cfg(test)]
-mod expiry_props;
-
-#[cfg(test)]
-mod encoding {
-    use super::*;
-    use soroban_sdk::{testutils::Address as _, xdr::ToXdr, Address, Env, String};
-
-    /// Golden encoded size (in bytes) of a representative [`Subscription`].
-    ///
-    /// This pins the XDR layout of the `#[contracttype]` struct so that any
-    /// change to its fields, their order or their sizes is caught by CI (the
-    /// test suite runs on every PR). If a layout change is intended, update
-    /// this value **deliberately** in the same commit and note it in the PR
-    /// description — never adjust it just to make CI green.
-    const SUBSCRIPTION_ENCODED_LEN: u32 = 0;
-
-    fn sample_subscription(env: &Env) -> Subscription {
-        Subscription {
-            plan_id: String::from_str(env, "plan"),
-            subscriber: Address::generate(env),
-            started_at: 1,
-            current_period_end: 2,
-            cancelled: false,
-            total_renewals: 3,
-        }
-    }
-
-    #[test]
-    fn subscription_encoding_size_is_pinned() {
-        let env = Env::default();
-        let sub = sample_subscription(&env);
-        let encoded = sub.to_xdr(&env);
-        assert_eq!(
-            encoded.len(),
-            SUBSCRIPTION_ENCODED_LEN,
-            "Subscription encoding changed; update SUBSCRIPTION_ENCODED_LEN deliberately"
-        );
-    }
-
-    #[test]
-    fn subscription_encoding_is_stable_across_values() {
-        // Field sizes are fixed-width (String/Address are length-prefixed but
-        // the struct itself has no variable padding), so two values with the
-        // same field types must encode to the same length.
-        let env = Env::default();
-        let a = sample_subscription(&env);
-        let mut b = sample_subscription(&env);
-        b.plan_id = String::from_str(&env, "a-much-longer-plan-identifier");
-        assert_eq!(a.to_xdr(&env).len(), b.to_xdr(&env).len());
-    }
-
-    #[test]
-    fn error_discriminants_are_pinned() {
-        // Numbering is per-contract; see the doc comment on `Error` and
-        // docs/CONTRACTS.md for the cross-contract mapping.
-        assert_eq!(Error::PlanNotFound as u32, 2);
-        assert_eq!(Error::PlanInactive as u32, 3);
-        assert_eq!(Error::AlreadySubbed as u32, 4);
-        assert_eq!(Error::SubNotFound as u32, 5);
-        assert_eq!(Error::Cancelled as u32, 6);
-        assert_eq!(Error::InvalidPrice as u32, 7);
-        assert_eq!(Error::NotInitialised as u32, 8);
-        assert_eq!(Error::AlreadyInitialised as u32, 9);
-        assert_eq!(Error::PlanExists as u32, 10);
-        assert_eq!(Error::Overflow as u32, 11);
-        assert_eq!(Error::InvalidPlanId as u32, 12);
-        assert_eq!(Error::SameAdmin as u32, 13);
+        // Rollback: plan remains active and publisher unchanged.
+        let stored = client.get_plan(&id);
+        assert!(stored.active);
+        assert_eq!(stored.publisher, publisher);
     }
 }

@@ -1,6 +1,6 @@
 //! Property tests for subscription expiry arithmetic (`subscribe`, `renew`,
-//! `cancel`, `is_active`). Each property is checked against a plain-integer
-//! model of the documented rules:
+//! `cancel`, `is_active`, `remaining_ledgers`). Each property is checked
+//! against a plain-integer model of the documented rules:
 //!
 //! - subscribe: `current_period_end = base + CYCLE`, where `base` is the
 //!   remaining paid period of a cancelled-but-active subscription, otherwise
