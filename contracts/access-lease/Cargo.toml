@@ -17,3 +17,7 @@ common = { path = "../common" }
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 proptest = "1.11.0"
+
+[[test]]
+name = "contract_auth"
+path = "tests/contract_auth.rs"
