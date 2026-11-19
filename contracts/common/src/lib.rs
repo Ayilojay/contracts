@@ -55,6 +55,9 @@ pub const BUMP: u32 = 1_000_000;
 /// invariant.
 pub const BUMP_THRESH: u32 = 100_000;
 
+/// Number of seconds in a day, used by [`lease_ttl_bump`].
+pub const DAY: u64 = 86_400;
+
 /// Storage key used to persist the state schema version.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -107,6 +110,16 @@ pub fn is_valid_ttl_policy(threshold: u32, target: u32) -> bool {
     threshold > 0 && target > 0 && threshold < target
 }
 
+/// Converts a lease duration in seconds to a TTL bump in days, rounding any
+/// fractional day up so the full duration is preserved.
+///
+/// Uses ceiling division with overflow-safe arithmetic: the `+ DAY - 1`
+/// numerator is computed with `saturating_add`, so very large `duration_secs`
+/// values saturate instead of panicking or wrapping.
+pub fn lease_ttl_bump(duration_secs: u64) -> u64 {
+    duration_secs.saturating_add(DAY - 1) / DAY
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +169,36 @@ mod tests {
         assert!(!is_valid_ttl_policy(0, BUMP));
         assert!(!is_valid_ttl_policy(BUMP_THRESH, 0));
         assert!(!is_valid_ttl_policy(0, 0));
+    }
+
+    #[test]
+    fn lease_ttl_bump_zero_is_zero() {
+        assert_eq!(lease_ttl_bump(0), 0);
+    }
+
+    #[test]
+    fn lease_ttl_bump_just_under_day_rounds_up() {
+        assert_eq!(lease_ttl_bump(DAY - 1), 1);
+        assert_eq!(lease_ttl_bump(1), 1);
+    }
+
+    #[test]
+    fn lease_ttl_bump_exact_day_is_exact() {
+        assert_eq!(lease_ttl_bump(DAY), 1);
+        assert_eq!(lease_ttl_bump(DAY * 3), 3);
+    }
+
+    #[test]
+    fn lease_ttl_bump_just_over_day_rounds_up() {
+        assert_eq!(lease_ttl_bump(DAY + 1), 2);
+        assert_eq!(lease_ttl_bump(DAY * 2 + 1), 3);
+    }
+
+    #[test]
+    fn lease_ttl_bump_saturates_on_overflow() {
+        // `u64::MAX + (DAY - 1)` would overflow; saturating add keeps it safe.
+        let expected = u64::MAX / DAY;
+        assert_eq!(lease_ttl_bump(u64::MAX), expected);
+        assert_eq!(lease_ttl_bump(u64::MAX - DAY), expected);
     }
 }
