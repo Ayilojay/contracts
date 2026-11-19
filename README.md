@@ -279,3 +279,6 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-237 -->
 - #237: [docs] Describe subscription APIs that are actually exported
+
+<!-- handsoff-issue-238 -->
+- #238: [docs] Correct retirement event data and registry initialization requirements
