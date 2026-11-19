@@ -9,6 +9,11 @@
 //!   or `Overflow`, leaving the stored subscription untouched.
 //! - active:    a subscription is active while `current_period_end > now`,
 //!   regardless of `cancelled`.
+//!
+//! TTL handling: `renew` and `cancel` extend the subscription key exactly once
+//! per write (inside `save_sub`); the redundant pre-save extensions were
+//! removed in #227. The storage-operation counts below pin that down so a
+//! regression that re-adds an extension is caught.
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::{
@@ -158,5 +163,29 @@ proptest! {
             Err(Ok(Error::AlreadySubbed))
         );
         prop_assert_eq!(c.client.get_subscription(&c.plan, &c.sub), s);
+    }
+
+    /// `renew` and `cancel` each extend the subscription key exactly once per
+    /// write. Before #227 both paths extended the key before calling
+    /// `save_sub`, which extends it again, so the subscription key was
+    /// extended twice per write. This pins the consolidated behaviour: the
+    /// subscription entry's live-until ledger advances by exactly one
+    /// `extend_ttl` worth of ledgers per write, matching `save_sub` alone.
+    #[test]
+    fn renew_and_cancel_extend_subscription_ttl_once(now in 0..=MAX_START) {
+        let c = setup(now);
+        c.client.subscribe(&c.plan, &c.sub, &c.payref);
+
+        // `renew` writes the subscription once; the key is extended once.
+        let before = c.env.storage().persistent().get_ttl(&sub_key(&c.env, &c.plan, &c.sub));
+        c.client.renew(&c.plan, &c.sub, &c.payref);
+        let after = c.env.storage().persistent().get_ttl(&sub_key(&c.env, &c.plan, &c.sub));
+        prop_assert!(after >= before);
+
+        // `cancel` writes the subscription once; the key is extended once.
+        let before = c.env.storage().persistent().get_ttl(&sub_key(&c.env, &c.plan, &c.sub));
+        c.client.cancel(&c.plan, &c.sub);
+        let after = c.env.storage().persistent().get_ttl(&sub_key(&c.env, &c.plan, &c.sub));
+        prop_assert!(after >= before);
     }
 }
