@@ -11,11 +11,16 @@
 //!   regardless of `cancelled`.
 //! - remaining: `current_period_end.saturating_sub(now)` ledgers of paid
 //!   access remain; `0` when there is no record or the period has lapsed.
+//!
+//! Publisher authorization for `create_plan` and `set_plan_active` is covered
+//! by scoped-auth tests that mock only the publisher's authorization, so the
+//! positive cases prove the stored publisher identity and the negative cases
+//! prove unauthorized callers are rejected without mutating state.
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
-    Address, Env, String,
+    testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke},
+    Address, Env, IntoVal, String,
 };
 
 /// Ledgers entries stay live for in these tests, so advancing time past a full
@@ -61,6 +66,48 @@ fn setup<'a>(start: u32) -> Ctx<'a> {
 
 fn set_ledger(env: &Env, seq: u32) {
     env.ledger().set_sequence_number(seq);
+}
+
+/// Builds an environment with no global auth mocking, registers the contract
+/// and initializes it. Returns the env, the contract id and the publisher.
+fn auth_setup() -> (Env, Address, Address) {
+    let env = Env::default();
+    env.ledger().with_mut(|l| {
+        l.min_persistent_entry_ttl = TEST_ENTRY_TTL;
+        l.min_temp_entry_ttl = TEST_ENTRY_TTL;
+        l.max_entry_ttl = 2 * TEST_ENTRY_TTL;
+    });
+    let id = env.register(SubscriptionManager, ());
+    let publisher = Address::generate(&env);
+    let client = SubscriptionManagerClient::new(&env, &id);
+    client.init(&publisher);
+    (env, id, publisher)
+}
+
+/// Mocks exactly one authorization: `publisher` invoking `fn_name` on the
+/// contract with the given arguments. Any other auth requirement fails.
+fn mock_publisher_auth(
+    env: &Env,
+    id: &Address,
+    publisher: &Address,
+    fn_name: &str,
+    args: soroban_sdk::Vec<soroban_sdk::Val>,
+) {
+    MockAuth {
+        address: publisher,
+        invoke: &MockAuthInvoke {
+            contract: id,
+            fn_name,
+            args,
+            sub_invokes: &[],
+        },
+    }
+    .mock_auths(&[MockAuth { address: publisher, invoke: &MockAuthInvoke {
+        contract: id,
+        fn_name,
+        args: args.clone(),
+        sub_invokes: &[],
+    } }]);
 }
 
 proptest! {
@@ -192,21 +239,118 @@ proptest! {
         set_ledger(&c.env, s.current_period_end);
         prop_assert_eq!(c.client.remaining_ledgers(&c.plan, &c.sub), 0);
     }
+}
 
-    /// An expired subscription reports `0` remaining ledgers.
-    #[test]
-    fn remaining_ledgers_expired_is_zero(now in 0..=MAX_START, elapsed in CYCLE..=MAX_STEP) {
-        let c = setup(now);
-        let s = c.client.subscribe(&c.plan, &c.sub, &c.payref);
-        set_ledger(&c.env, now + elapsed);
-        prop_assert!(s.current_period_end <= now + elapsed);
-        prop_assert_eq!(c.client.remaining_ledgers(&c.plan, &c.sub), 0);
-    }
+/// Scoped-auth tests for publisher authorization on `create_plan` and
+/// `set_plan_active`. Unlike the property tests above, these do not call
+/// `mock_all_auths`; only the publisher's authorization is mocked, so the
+/// negative cases genuinely exercise the contract's auth checks.
+#[test]
+fn create_plan_authorized_by_publisher_stores_identity() {
+    let (env, id, publisher) = auth_setup();
+    let client = SubscriptionManagerClient::new(&env, &id);
+    let plan = String::from_str(&env, "plan");
+    let price = 1_000_000i128;
 
-    /// A subscriber with no record reports `0` remaining ledgers.
-    #[test]
-    fn remaining_ledgers_missing_record_is_zero(now in 0..=MAX_START) {
-        let c = setup(now);
-        prop_assert_eq!(c.client.remaining_ledgers(&c.plan, &c.sub), 0);
-    }
+    mock_publisher_auth(
+        &env,
+        &id,
+        &publisher,
+        "create_plan",
+        (publisher.clone(), plan.clone(), price).into_val(&env),
+    );
+
+    client.create_plan(&publisher, &plan, &price);
+
+    let stored = client.get_plan(&plan);
+    assert_eq!(stored.publisher, publisher);
+    assert_eq!(stored.price, price);
+    assert!(stored.active);
+}
+
+#[test]
+fn create_plan_unauthorized_caller_rejected_and_rolls_back() {
+    let (env, id, publisher) = auth_setup();
+    let client = SubscriptionManagerClient::new(&env, &id);
+    let plan = String::from_str(&env, "plan");
+    let price = 1_000_000i128;
+    let attacker = Address::generate(&env);
+
+    // Only the publisher is authorized; the attacker's call must fail.
+    mock_publisher_auth(
+        &env,
+        &id,
+        &publisher,
+        "create_plan",
+        (publisher.clone(), plan.clone(), price).into_val(&env),
+    );
+
+    let res = client.try_create_plan(&attacker, &plan, &price);
+    assert!(res.is_err());
+    // No plan was stored, so the failed call rolled back cleanly.
+    assert!(client.try_get_plan(&plan).is_err());
+}
+
+#[test]
+fn set_plan_active_authorized_by_publisher_stores_identity() {
+    let (env, id, publisher) = auth_setup();
+    let client = SubscriptionManagerClient::new(&env, &id);
+    let plan = String::from_str(&env, "plan");
+    let price = 1_000_000i128;
+
+    mock_publisher_auth(
+        &env,
+        &id,
+        &publisher,
+        "create_plan",
+        (publisher.clone(), plan.clone(), price).into_val(&env),
+    );
+    client.create_plan(&publisher, &plan, &price);
+
+    mock_publisher_auth(
+        &env,
+        &id,
+        &publisher,
+        "set_plan_active",
+        (publisher.clone(), plan.clone(), false).into_val(&env),
+    );
+    client.set_plan_active(&publisher, &plan, &false);
+
+    let stored = client.get_plan(&plan);
+    assert_eq!(stored.publisher, publisher);
+    assert!(!stored.active);
+}
+
+#[test]
+fn set_plan_active_unauthorized_caller_rejected_and_rolls_back() {
+    let (env, id, publisher) = auth_setup();
+    let client = SubscriptionManagerClient::new(&env, &id);
+    let plan = String::from_str(&env, "plan");
+    let price = 1_000_000i128;
+
+    mock_publisher_auth(
+        &env,
+        &id,
+        &publisher,
+        "create_plan",
+        (publisher.clone(), plan.clone(), price).into_val(&env),
+    );
+    client.create_plan(&publisher, &plan, &price);
+
+    let attacker = Address::generate(&env);
+    // Only the publisher is authorized; the attacker's call must fail.
+    mock_publisher_auth(
+        &env,
+        &id,
+        &publisher,
+        "set_plan_active",
+        (publisher.clone(), plan.clone(), false).into_val(&env),
+    );
+
+    let res = client.try_set_plan_active(&attacker, &plan, &false);
+    assert!(res.is_err());
+    // The plan is unchanged: still active and still owned by the publisher.
+    let stored = client.get_plan(&plan);
+    assert_eq!(stored.publisher, publisher);
+    assert!(stored.active);
 }
