@@ -247,7 +247,8 @@ pub struct Resource {
     pub price: i128,        // USDC stroops, > 0
     pub metadata: String,   // IPFS URI / content hash, <= 512 bytes
     pub listed: bool,       // true on register
-    pub tags: Vec<String>,  // <= 8 tags, each 1..=32 bytes
+    pub retired: bool,      // false on register; set true by retire_resource (irreversible)
+    pub tags: Vec<String>,  // <= 8 tags, each 1..=32 printable-ASCII bytes (0x21–0x7E)
 }
 ```
 
@@ -258,6 +259,14 @@ pub struct Resource {
 | `MAX_TAGS` | 8 |
 | `MAX_TAG_LEN` | 32 bytes |
 | `MAX_PAGE_SIZE` | 20 |
+
+**Tag character alphabet (fixes #195):** every byte of each tag must be a
+printable non-space ASCII character in the range `0x21` (`!`) through `0x7E`
+(`~`). Control bytes (0x00–0x1F) and whitespace (0x20, space) and DEL (0x7F)
+are rejected. Non-ASCII bytes (≥ 0x80) are also rejected. Uppercase letters
+are accepted on input and normalised to lowercase before storage, so the
+effective stored alphabet is `[a-z0-9!"#$%&'()*+,\-./:;<=>?@[\\\]^_{|}~]`.
+Any tag byte outside this range causes `InvalidTag`.
 
 ### Functions
 
@@ -274,10 +283,10 @@ pub struct Resource {
 | `propose_transfer(id, new_creator)` | Creator | `()` | `InvalidResourceId`, `NotFound` |
 | `accept_transfer(id, new_creator)` | `new_creator` | `()` | `InvalidResourceId`, `NotFound`, `NoPendingTransfer`, `NotPendingOwner` |
 | `cancel_transfer(id)` | Creator | `()` | `InvalidResourceId`, `NotFound` |
-| `set_listed(id, listed)` | Creator | `()` | `InvalidResourceId`, `NotFound` |
-| `delist(id)` | Creator | `()` | `InvalidResourceId`, `NotFound` |
+| `set_listed(id, listed)` | Creator | `()` | `InvalidResourceId`, `NotFound`, `ResourceRetired` |
+| `delist(id)` | Creator | `()` | `InvalidResourceId`, `NotFound`, `ResourceRetired` |
+| `retire_resource(id)` | Admin | `()` | `NotInitialised`, `InvalidResourceId`, `NotFound`, `ResourceRetired` |
 | `list(start, limit, only_listed, tag)` | — | `Vec<Resource>` | — (limit capped at 20; scan window capped at `limit*2 + 20` slots) |
-| `list(start, limit)` | — | `Vec<Resource>` | — (limit capped at 20) |
 | `get(id)` | — | `Resource` | `NotFound` |
 | `exists(id)` | — | `bool` | — |
 | `get_owner(id)` | — | `Address` | `NotFound` |
@@ -327,6 +336,45 @@ requested range, advance `start` and paginate to retrieve more results.
 | `Admin` | instance | `Address` | — |
 | `Version` | instance | `String` | — |
 
+### XDR compatibility and layout stability
+
+The `Resource` struct is serialised to XDR by the Soroban host and stored in
+persistent ledger entries under `DataKey::Resource(id)`. **Any change to the
+struct layout — adding, removing or reordering fields, or changing a field's
+type — makes existing stored entries unreadable** and causes calls that read
+them to trap.
+
+**Current layout (as of the `retired` field addition):**
+
+```
+Resource {
+  id:       String          (field 0)
+  creator:  Address         (field 1)
+  price:    i128            (field 2)
+  metadata: String          (field 3)
+  listed:   bool            (field 4)
+  retired:  bool            (field 5)   ← added alongside retire_resource
+  tags:     Vec<String>     (field 6)
+}
+```
+
+This layout is pinned by `xdr_resource_fixture_stable` and
+`xdr_resource_max_size_fixture` in `contracts/vault-registry/src/test.rs`.
+If the layout changes again:
+
+1. Update the fixture tests in the same PR.
+2. Add a migration strategy here: either keep the old encoding readable by
+   storing the new shape under a new `DataKey`, or ship explicit migration
+   logic in the new WASM that rewrites old entries.
+3. Test the upgrade on testnet against live data before mainnet.
+
+**Existing deployments:** records registered before the `retired` field was
+added cannot be read by the current code. If you are upgrading from a version
+without `retired`, you must run a migration that rewrites each `Resource` entry
+to include the new field (with `retired = false`) before any read-path
+entrypoint is called. The `migrate()` admin entrypoint is the recommended place
+to do this.
+
 ### Events
 
 | Topics | Data |
@@ -355,7 +403,7 @@ for how they compare with the other contracts.
 | 2 | `NotFound` | No resource with `id`. |
 | 3 | `InvalidPrice` | Price ≤ 0. |
 | 4 | `MetadataTooLong` | Metadata > 512 bytes. |
-| 5 | `InvalidTag` | > 8 tags, or a tag is empty / > 32 bytes / duplicate. |
+| 5 | `InvalidTag` | > 8 tags, or a tag is empty / > 32 bytes / contains a byte outside the accepted printable-ASCII alphabet (`0x21–0x7E`; control bytes, whitespace and non-ASCII bytes are rejected) / duplicate. |
 | 6 | `NotAdmin` | Reserved. |
 | 7 | `NotInitialised` | Admin-only call before `init`. |
 | 8 | `AlreadyInitialised` | `init` called twice. |
@@ -363,6 +411,7 @@ for how they compare with the other contracts.
 | 10 | `InvalidResourceId` | Resource id is empty or > 64 bytes. |
 | 11 | `NoPendingTransfer` | `accept_transfer` called with no pending proposal. |
 | 12 | `NotPendingOwner` | Caller is not the proposed new owner. |
+| 13 | `ResourceRetired` | The resource has been retired and can no longer be mutated. |
 
 ---
 
