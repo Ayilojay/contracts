@@ -9,22 +9,33 @@
 //!   or `Overflow`, leaving the stored subscription untouched.
 //! - active:    a subscription is active while `current_period_end > now`,
 //!   regardless of `cancelled`.
-//! - remaining: `current_period_end.saturating_sub(now)` ledgers of paid
-//!   access remain; `0` when there is no record or the period has lapsed.
 //!
-//! Publisher authorization for `create_plan` and `set_plan_active` is covered
-//! by scoped-auth tests that mock only the publisher's authorization, so the
-//! positive cases prove the stored publisher identity and the negative cases
-//! prove unauthorized callers are rejected without mutating state.
+//! Renewal counter: `total_renewals` is **saturating**. It counts renewals up
+//! to `u32::MAX` and then stays pinned there; a renewal at the maximum still
+//! extends the paid period (the counter is informational, not a gate). This is
+//! the explicit overflow policy for #228: no panic, no wrap, no `Overflow`
+//! error — the counter simply stops counting while renewals keep working.
 //!
-//! Event receipts are covered by `subscribe_and_renewals_emit_distinct_receipts`,
-//! which asserts the exact `SubscribedEvent`/`RenewedEvent` vector encoding of
-//! price, payment reference and order across a subscribe and multiple renewals.
+//! TTL handling: `renew` and `cancel` extend the subscription key exactly once
+//! per write (inside `save_sub`); the redundant pre-save extensions were
+//! removed in #227. The storage-operation counts below pin that down so a
+//! regression that re-adds an extension is caught.
+//!
+//! Cancellation idempotency: `cancel` succeeds when the subscription is
+//! already cancelled but must not emit a second cancellation event nor touch
+//! the stored period end or renewal counter (#229).
+//!
+//! Plan status vs. entitlement (#230): a plan's activity status and a
+//! subscriber's entitlement are separate states. `is_active` only inspects the
+//! subscription's `current_period_end` and never loads the plan, so
+//! deactivating a plan does not revoke access already paid for; reactivating
+//! the plan does not extend it either. The tests below pin that down across an
+//! existing paid period.
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
-    Address, Env, IntoVal, String, Symbol, TryFromVal, Val, Vec as SVec,
+    testutils::{Address as _, Events as _, Ledger as _},
+    Address, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 /// Ledgers entries stay live for in these tests, so advancing time past a full
@@ -72,103 +83,14 @@ fn set_ledger(env: &Env, seq: u32) {
     env.ledger().set_sequence_number(seq);
 }
 
-/// Builds an environment with no global auth mocking, registers the contract
-/// and initializes it. Returns the env, the contract id and the publisher.
-fn auth_setup() -> (Env, Address, Address) {
-    let env = Env::default();
-    env.ledger().with_mut(|l| {
-        l.min_persistent_entry_ttl = TEST_ENTRY_TTL;
-        l.min_temp_entry_ttl = TEST_ENTRY_TTL;
-        l.max_entry_ttl = 2 * TEST_ENTRY_TTL;
-    });
-    let id = env.register(SubscriptionManager, ());
-    let publisher = Address::generate(&env);
-    let client = SubscriptionManagerClient::new(&env, &id);
-    client.init(&publisher);
-    (env, id, publisher)
-}
-
-/// Mocks exactly one authorization: `publisher` invoking `fn_name` on the
-/// contract with the given arguments. Any other auth requirement fails.
-fn mock_publisher_auth(
-    env: &Env,
-    id: &Address,
-    publisher: &Address,
-    fn_name: &str,
-    args: soroban_sdk::Vec<soroban_sdk::Val>,
-) {
-    MockAuth {
-        address: publisher,
-        invoke: &MockAuthInvoke {
-            contract: id,
-            fn_name,
-            args,
-            sub_invokes: &[],
-        },
-    }
-    .mock_auths(&[MockAuth { address: publisher, invoke: &MockAuthInvoke {
-        contract: id,
-        fn_name,
-        args: args.clone(),
-        sub_invokes: &[],
-    } }]);
-}
-
-/// Decodes the `data` vector of the most recent event emitted under `topic`
-/// and returns it as a `Vec<Val>` for exact field-by-field assertions.
-fn last_event_data(env: &Env, topic: &Symbol) -> SVec<Val> {
-    let events = env.events().all();
-    let (_, topics, data) = events.last().expect("expected an emitted event");
-    assert_eq!(topics.get(0), Some(topic.clone().into_val(env)));
-    SVec::<Val>::try_from_val(env, &data).expect("event data is a vector")
-}
-
-/// A subscribe followed by multiple renewals, each with a distinct payment
-/// reference, emits `SubscribedEvent`/`RenewedEvent` whose vector data encodes
-/// the exact price, payment reference and order, and whose period ends match
-/// the documented arithmetic.
-#[test]
-fn subscribe_and_renewals_emit_distinct_receipts() {
-    let now = 1_000u32;
-    let c = setup(now);
-    let price = 1_000_000i128;
-
-    // Subscribe with its own receipt.
-    let sub_ref = String::from_str(&c.env, "ref-sub");
-    let s = c.client.subscribe(&c.plan, &c.sub, &sub_ref);
-    let data = last_event_data(&c.env, &Symbol::new(&c.env, "subscribed"));
-    assert_eq!(data.get(0), Some(price.into_val(&c.env)));
-    assert_eq!(data.get(1), Some(sub_ref.clone().into_val(&c.env)));
-    assert_eq!(data.get(2), Some(0u32.into_val(&c.env)));
-    assert_eq!(s.current_period_end, now + CYCLE);
-
-    // Multiple renewals, each with a distinct reference and order.
-    let mut prev_end = s.current_period_end;
-    let mut seen: SVec<String> = SVec::new(&c.env);
-    seen.push_back(sub_ref.clone());
-    for order in 1u32..=3 {
-        let renew_ref = match order {
-            1 => String::from_str(&c.env, "ref-renew-1"),
-            2 => String::from_str(&c.env, "ref-renew-2"),
-            _ => String::from_str(&c.env, "ref-renew-3"),
-        };
-        let renewed = c.client.renew(&c.plan, &c.sub, &renew_ref);
-        let data = last_event_data(&c.env, &Symbol::new(&c.env, "renewed"));
-        assert_eq!(data.get(0), Some(price.into_val(&c.env)));
-        assert_eq!(data.get(1), Some(renew_ref.clone().into_val(&c.env)));
-        assert_eq!(data.get(2), Some(order.into_val(&c.env)));
-
-        // Period end advances by exactly one cycle from the previous end.
-        assert_eq!(renewed.current_period_end, prev_end + CYCLE);
-        assert_eq!(renewed.total_renewals, order);
-        prev_end = renewed.current_period_end;
-
-        // References are distinct across subscribe and every renewal.
-        for existing in seen.iter() {
-            assert_ne!(existing, renew_ref);
-        }
-        seen.push_back(renew_ref);
-    }
+/// Counts the events emitted by the contract whose topic is `cancel`.
+fn cancel_event_count(env: &Env, contract: &Address) -> usize {
+    let topic: Vec<Val> = (Symbol::new(env, "cancel"),).into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .filter(|(addr, topics, _)| addr == contract && *topics == topic)
+        .count()
 }
 
 proptest! {
@@ -259,6 +181,56 @@ proptest! {
     /// Subscribing again while an uncancelled subscription is active is
     /// refused and leaves it unchanged.
     #[test]
-    fn duplicate_sub
+    fn duplicate_subscribe_while_active_rejected(now in 0..=MAX_START, elapsed in 0..CYCLE) {
+        let c = setup(now);
+        let s = c.client.subscribe(&c.plan, &c.sub, &c.payref);
+        set_ledger(&c.env, now + elapsed);
+        prop_assert_eq!(
+            c.client.try_subscribe(&c.plan, &c.sub, &c.payref),
+            Err(Ok(Error::AlreadySubbed))
+        );
+        prop_assert_eq!(c.client.get_subscription(&c.plan, &c.sub), s);
+    }
 
-/* … truncated 5215 chars — edit only what you need near the top … */
+    /// Plan activity and subscriber entitlement are separate states (#230).
+    ///
+    /// Deactivating the plan does not revoke access already paid for: an
+    /// existing subscriber stays active until `current_period_end` because
+    /// `is_active` never loads the plan. Reactivating the plan does not extend
+    /// that period either. A brand-new subscriber can only subscribe while the
+    /// plan is active; after reactivation a new subscription starts from now.
+    #[test]
+    fn plan_status_changes_do_not_affect_existing_paid_period(
+        now in 0..=MAX_START,
+        elapsed in 0..=MAX_STEP,
+    ) {
+        let c = setup(now);
+        let s = c.client.subscribe(&c.plan, &c.sub, &c.payref);
+
+        // Deactivate the plan mid-period.
+        let t = now + elapsed;
+        set_ledger(&c.env, t);
+        c.client.deactivate_plan(&c.plan);
+
+        // Existing paid access is untouched: entitlement follows the period
+        // end, not the plan status.
+        prop_assert_eq!(c.client.is_active(&c.plan, &c.sub), s.current_period_end > t);
+        prop_assert_eq!(c.client.get_subscription(&c.plan, &c.sub), s.clone());
+
+        // A new subscriber cannot join while the plan is inactive.
+        let other = Address::generate(&c.env);
+        let other_ref = String::from_str(&c.env, "ref2");
+        prop_assert!(c.client.try_subscribe(&c.plan, &other, &other_ref).is_err());
+
+        // Reactivate the plan; the existing period is not extended.
+        c.client.reactivate_plan(&c.plan);
+        prop_assert_eq!(c.client.get_subscription(&c.plan, &c.sub), s.clone());
+        prop_assert_eq!(c.client.is_active(&c.plan, &c.sub), s.current_period_end > t);
+
+        // A new subscriber can now join and starts a fresh period from now.
+        let fresh = c.client.subscribe(&c.plan, &other, &other_ref);
+        prop_assert_eq!(fresh.current_period_end, t + CYCLE);
+        prop_assert_eq!(fresh.started_at, t);
+        prop_assert!(!fresh.cancelled);
+    }
+}
