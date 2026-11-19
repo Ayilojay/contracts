@@ -276,3 +276,6 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-116 -->
 - #116: [docs and tooling] Doc comments on Lease, Subscription and Plan use "30-day" and "ledgers" interchangeably; state the conversi...
+
+<!-- handsoff-issue-232 -->
+- #232: [subscription] Expose the billing cycle length through the contract interface
