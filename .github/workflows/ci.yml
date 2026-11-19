@@ -106,8 +106,6 @@ jobs:
       - name: Gas / footprint report (vault-registry)
         run: cargo test --locked --package vault-registry gas -- --nocapture
 
-  contracttype-size:
-    name: #[contracttype] encoding size checks
   test-workspace:
     name: Test workspace
     runs-on: ubuntu-latest
