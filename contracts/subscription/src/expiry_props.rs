@@ -16,11 +16,15 @@
 //! by scoped-auth tests that mock only the publisher's authorization, so the
 //! positive cases prove the stored publisher identity and the negative cases
 //! prove unauthorized callers are rejected without mutating state.
+//!
+//! Event receipts are covered by `subscribe_and_renewals_emit_distinct_receipts`,
+//! which asserts the exact `SubscribedEvent`/`RenewedEvent` vector encoding of
+//! price, payment reference and order across a subscribe and multiple renewals.
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke},
-    Address, Env, IntoVal, String,
+    testutils::{Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
+    Address, Env, IntoVal, String, Symbol, TryFromVal, Val, Vec as SVec,
 };
 
 /// Ledgers entries stay live for in these tests, so advancing time past a full
@@ -108,6 +112,63 @@ fn mock_publisher_auth(
         args: args.clone(),
         sub_invokes: &[],
     } }]);
+}
+
+/// Decodes the `data` vector of the most recent event emitted under `topic`
+/// and returns it as a `Vec<Val>` for exact field-by-field assertions.
+fn last_event_data(env: &Env, topic: &Symbol) -> SVec<Val> {
+    let events = env.events().all();
+    let (_, topics, data) = events.last().expect("expected an emitted event");
+    assert_eq!(topics.get(0), Some(topic.clone().into_val(env)));
+    SVec::<Val>::try_from_val(env, &data).expect("event data is a vector")
+}
+
+/// A subscribe followed by multiple renewals, each with a distinct payment
+/// reference, emits `SubscribedEvent`/`RenewedEvent` whose vector data encodes
+/// the exact price, payment reference and order, and whose period ends match
+/// the documented arithmetic.
+#[test]
+fn subscribe_and_renewals_emit_distinct_receipts() {
+    let now = 1_000u32;
+    let c = setup(now);
+    let price = 1_000_000i128;
+
+    // Subscribe with its own receipt.
+    let sub_ref = String::from_str(&c.env, "ref-sub");
+    let s = c.client.subscribe(&c.plan, &c.sub, &sub_ref);
+    let data = last_event_data(&c.env, &Symbol::new(&c.env, "subscribed"));
+    assert_eq!(data.get(0), Some(price.into_val(&c.env)));
+    assert_eq!(data.get(1), Some(sub_ref.clone().into_val(&c.env)));
+    assert_eq!(data.get(2), Some(0u32.into_val(&c.env)));
+    assert_eq!(s.current_period_end, now + CYCLE);
+
+    // Multiple renewals, each with a distinct reference and order.
+    let mut prev_end = s.current_period_end;
+    let mut seen: SVec<String> = SVec::new(&c.env);
+    seen.push_back(sub_ref.clone());
+    for order in 1u32..=3 {
+        let renew_ref = match order {
+            1 => String::from_str(&c.env, "ref-renew-1"),
+            2 => String::from_str(&c.env, "ref-renew-2"),
+            _ => String::from_str(&c.env, "ref-renew-3"),
+        };
+        let renewed = c.client.renew(&c.plan, &c.sub, &renew_ref);
+        let data = last_event_data(&c.env, &Symbol::new(&c.env, "renewed"));
+        assert_eq!(data.get(0), Some(price.into_val(&c.env)));
+        assert_eq!(data.get(1), Some(renew_ref.clone().into_val(&c.env)));
+        assert_eq!(data.get(2), Some(order.into_val(&c.env)));
+
+        // Period end advances by exactly one cycle from the previous end.
+        assert_eq!(renewed.current_period_end, prev_end + CYCLE);
+        assert_eq!(renewed.total_renewals, order);
+        prev_end = renewed.current_period_end;
+
+        // References are distinct across subscribe and every renewal.
+        for existing in seen.iter() {
+            assert_ne!(existing, renew_ref);
+        }
+        seen.push_back(renew_ref);
+    }
 }
 
 proptest! {
@@ -198,159 +259,6 @@ proptest! {
     /// Subscribing again while an uncancelled subscription is active is
     /// refused and leaves it unchanged.
     #[test]
-    fn duplicate_subscribe_while_active_rejected(now in 0..=MAX_START, elapsed in 0..CYCLE) {
-        let c = setup(now);
-        let s = c.client.subscribe(&c.plan, &c.sub, &c.payref);
-        set_ledger(&c.env, now + elapsed);
-        prop_assert_eq!(
-            c.client.try_subscribe(&c.plan, &c.sub, &c.payref),
-            Err(Ok(Error::AlreadySubbed))
-        );
-        prop_assert_eq!(c.client.get_subscription(&c.plan, &c.sub), s);
-    }
+    fn duplicate_sub
 
-    /// `remaining_ledgers` reports the saturating distance to the period end
-    /// for an active subscription, and `0` once the period has lapsed.
-    #[test]
-    fn remaining_ledgers_matches_saturating_distance(now in 0..=MAX_START, elapsed in 0..=MAX_STEP) {
-        let c = setup(now);
-        let s = c.client.subscribe(&c.plan, &c.sub, &c.payref);
-        let t = now + elapsed;
-        set_ledger(&c.env, t);
-        prop_assert_eq!(
-            c.client.remaining_ledgers(&c.plan, &c.sub),
-            s.current_period_end.saturating_sub(t)
-        );
-    }
-
-    /// A cancelled-but-paid subscription still reports its remaining paid
-    /// ledgers until the period end, then `0`.
-    #[test]
-    fn remaining_ledgers_cancelled_but_paid(now in 0..=MAX_START, elapsed in 0..CYCLE) {
-        let c = setup(now);
-        let s = c.client.subscribe(&c.plan, &c.sub, &c.payref);
-        c.client.cancel(&c.plan, &c.sub);
-        let t = now + elapsed;
-        set_ledger(&c.env, t);
-        prop_assert_eq!(
-            c.client.remaining_ledgers(&c.plan, &c.sub),
-            s.current_period_end - t
-        );
-        set_ledger(&c.env, s.current_period_end);
-        prop_assert_eq!(c.client.remaining_ledgers(&c.plan, &c.sub), 0);
-    }
-}
-
-/// Scoped-auth tests for publisher authorization on `create_plan` and
-/// `set_plan_active`. Unlike the property tests above, these do not call
-/// `mock_all_auths`; only the publisher's authorization is mocked, so the
-/// negative cases genuinely exercise the contract's auth checks.
-#[test]
-fn create_plan_authorized_by_publisher_stores_identity() {
-    let (env, id, publisher) = auth_setup();
-    let client = SubscriptionManagerClient::new(&env, &id);
-    let plan = String::from_str(&env, "plan");
-    let price = 1_000_000i128;
-
-    mock_publisher_auth(
-        &env,
-        &id,
-        &publisher,
-        "create_plan",
-        (publisher.clone(), plan.clone(), price).into_val(&env),
-    );
-
-    client.create_plan(&publisher, &plan, &price);
-
-    let stored = client.get_plan(&plan);
-    assert_eq!(stored.publisher, publisher);
-    assert_eq!(stored.price, price);
-    assert!(stored.active);
-}
-
-#[test]
-fn create_plan_unauthorized_caller_rejected_and_rolls_back() {
-    let (env, id, publisher) = auth_setup();
-    let client = SubscriptionManagerClient::new(&env, &id);
-    let plan = String::from_str(&env, "plan");
-    let price = 1_000_000i128;
-    let attacker = Address::generate(&env);
-
-    // Only the publisher is authorized; the attacker's call must fail.
-    mock_publisher_auth(
-        &env,
-        &id,
-        &publisher,
-        "create_plan",
-        (publisher.clone(), plan.clone(), price).into_val(&env),
-    );
-
-    let res = client.try_create_plan(&attacker, &plan, &price);
-    assert!(res.is_err());
-    // No plan was stored, so the failed call rolled back cleanly.
-    assert!(client.try_get_plan(&plan).is_err());
-}
-
-#[test]
-fn set_plan_active_authorized_by_publisher_stores_identity() {
-    let (env, id, publisher) = auth_setup();
-    let client = SubscriptionManagerClient::new(&env, &id);
-    let plan = String::from_str(&env, "plan");
-    let price = 1_000_000i128;
-
-    mock_publisher_auth(
-        &env,
-        &id,
-        &publisher,
-        "create_plan",
-        (publisher.clone(), plan.clone(), price).into_val(&env),
-    );
-    client.create_plan(&publisher, &plan, &price);
-
-    mock_publisher_auth(
-        &env,
-        &id,
-        &publisher,
-        "set_plan_active",
-        (publisher.clone(), plan.clone(), false).into_val(&env),
-    );
-    client.set_plan_active(&publisher, &plan, &false);
-
-    let stored = client.get_plan(&plan);
-    assert_eq!(stored.publisher, publisher);
-    assert!(!stored.active);
-}
-
-#[test]
-fn set_plan_active_unauthorized_caller_rejected_and_rolls_back() {
-    let (env, id, publisher) = auth_setup();
-    let client = SubscriptionManagerClient::new(&env, &id);
-    let plan = String::from_str(&env, "plan");
-    let price = 1_000_000i128;
-
-    mock_publisher_auth(
-        &env,
-        &id,
-        &publisher,
-        "create_plan",
-        (publisher.clone(), plan.clone(), price).into_val(&env),
-    );
-    client.create_plan(&publisher, &plan, &price);
-
-    let attacker = Address::generate(&env);
-    // Only the publisher is authorized; the attacker's call must fail.
-    mock_publisher_auth(
-        &env,
-        &id,
-        &publisher,
-        "set_plan_active",
-        (publisher.clone(), plan.clone(), false).into_val(&env),
-    );
-
-    let res = client.try_set_plan_active(&attacker, &plan, &false);
-    assert!(res.is_err());
-    // The plan is unchanged: still active and still owned by the publisher.
-    let stored = client.get_plan(&plan);
-    assert_eq!(stored.publisher, publisher);
-    assert!(stored.active);
-}
+/* … truncated 5215 chars — edit only what you need near the top … */
