@@ -17,6 +17,19 @@
 //! The numeric helpers below are the shared, canonical state-schema API. They
 //! are intentionally independent of the string package version so that
 //! storage migrations can be reasoned about without touching crate releases.
+//!
+//! # TTL policy model
+//!
+//! Shared TTL policies pair a *threshold* (the remaining-live-ledgers point at
+//! which a bump is triggered) with a *target* (the live-ledgers value restored
+//! by the bump). Valid policies satisfy:
+//!
+//! * `threshold > 0` and `target > 0`,
+//! * `threshold < target` — a bump must extend beyond the point that triggers
+//!   it, otherwise the entry would be bumped on every access.
+//!
+//! This mirrors the threshold-below-target relationship used by the
+//! contract-local policies.
 
 #![no_std]
 
@@ -30,6 +43,17 @@ pub const VERSION: u32 = 1;
 
 /// Minimum state schema version this code can read without migration.
 pub const MIN_COMPATIBLE_VERSION: u32 = 1;
+
+/// Shared TTL bump target: live-ledgers value restored when a bump fires.
+pub const BUMP: u32 = 1_000_000;
+
+/// Shared TTL bump threshold: remaining-live-ledgers point that triggers a
+/// bump. Must be strictly below [`BUMP`].
+///
+/// Retired: the previous value (`1_000_000`) was not below the target and is
+/// no longer used; the corrected value keeps the threshold-below-target
+/// invariant.
+pub const BUMP_THRESH: u32 = 100_000;
 
 /// Storage key used to persist the state schema version.
 #[contracttype]
@@ -77,6 +101,12 @@ pub fn ensure_compatible(env: &Env) -> Result<(), VersionError> {
     }
 }
 
+/// Returns `true` when `(threshold, target)` is a valid TTL policy pair:
+/// both are non-zero and the threshold is strictly below the target.
+pub fn is_valid_ttl_policy(threshold: u32, target: u32) -> bool {
+    threshold > 0 && target > 0 && threshold < target
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +135,26 @@ mod tests {
         write_state_version(&env);
         assert_eq!(read_state_version(&env), Some(VERSION));
         assert!(ensure_compatible(&env).is_ok());
+    }
+
+    #[test]
+    fn shared_ttl_policy_is_valid() {
+        assert!(is_valid_ttl_policy(BUMP_THRESH, BUMP));
+        assert!(BUMP_THRESH < BUMP);
+        assert!(BUMP_THRESH > 0);
+        assert!(BUMP > 0);
+    }
+
+    #[test]
+    fn ttl_policy_rejects_threshold_at_or_above_target() {
+        assert!(!is_valid_ttl_policy(BUMP, BUMP));
+        assert!(!is_valid_ttl_policy(BUMP, BUMP_THRESH));
+    }
+
+    #[test]
+    fn ttl_policy_rejects_zero_values() {
+        assert!(!is_valid_ttl_policy(0, BUMP));
+        assert!(!is_valid_ttl_policy(BUMP_THRESH, 0));
+        assert!(!is_valid_ttl_policy(0, 0));
     }
 }
