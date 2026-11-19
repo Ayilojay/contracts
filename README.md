@@ -282,3 +282,6 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-238 -->
 - #238: [docs] Correct retirement event data and registry initialization requirements
+
+<!-- handsoff-issue-239 -->
+- #239: [docs] Update event encoding conventions for vector payloads
