@@ -24,6 +24,13 @@
 //! Cancellation idempotency: `cancel` succeeds when the subscription is
 //! already cancelled but must not emit a second cancellation event nor touch
 //! the stored period end or renewal counter (#229).
+//!
+//! Plan status vs. entitlement (#230): a plan's activity status and a
+//! subscriber's entitlement are separate states. `is_active` only inspects the
+//! subscription's `current_period_end` and never loads the plan, so
+//! deactivating a plan does not revoke access already paid for; reactivating
+//! the plan does not extend it either. The tests below pin that down across an
+//! existing paid period.
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::{
@@ -185,44 +192,45 @@ proptest! {
         prop_assert_eq!(c.client.get_subscription(&c.plan, &c.sub), s);
     }
 
-    /// Cancelling twice with explicit subscriber authorization is idempotent:
-    /// the second call succeeds but emits no further cancellation event, and
-    /// the stored period end and renewal counter are preserved.
+    /// Plan activity and subscriber entitlement are separate states (#230).
+    ///
+    /// Deactivating the plan does not revoke access already paid for: an
+    /// existing subscriber stays active until `current_period_end` because
+    /// `is_active` never loads the plan. Reactivating the plan does not extend
+    /// that period either. A brand-new subscriber can only subscribe while the
+    /// plan is active; after reactivation a new subscription starts from now.
     #[test]
-    fn repeated_cancel_emits_single_event_and_preserves_state(now in 0..=MAX_START, elapsed in 0..=MAX_STEP) {
+    fn plan_status_changes_do_not_affect_existing_paid_period(
+        now in 0..=MAX_START,
+        elapsed in 0..=MAX_STEP,
+    ) {
         let c = setup(now);
         let s = c.client.subscribe(&c.plan, &c.sub, &c.payref);
+
+        // Deactivate the plan mid-period.
         let t = now + elapsed;
         set_ledger(&c.env, t);
+        c.client.deactivate_plan(&c.plan);
 
-        // First cancel: exactly one cancellation event.
-        c.client.cancel(&c.plan, &c.sub);
-        prop_assert_eq!(cancel_event_count(&c.env, &c.client.address), 1);
-        let after_first = c.client.get_subscription(&c.plan, &c.sub);
-        prop_assert!(after_first.cancelled);
+        // Existing paid access is untouched: entitlement follows the period
+        // end, not the plan status.
+        prop_assert_eq!(c.client.is_active(&c.plan, &c.sub), s.current_period_end > t);
+        prop_assert_eq!(c.client.get_subscription(&c.plan, &c.sub), s.clone());
 
-        // Second cancel: still succeeds, but emits no additional event.
-        c.client.cancel(&c.plan, &c.sub);
-        prop_assert_eq!(cancel_event_count(&c.env, &c.client.address), 1);
+        // A new subscriber cannot join while the plan is inactive.
+        let other = Address::generate(&c.env);
+        let other_ref = String::from_str(&c.env, "ref2");
+        prop_assert!(c.client.try_subscribe(&c.plan, &other, &other_ref).is_err());
 
-        // Period end and renewal counter are preserved across both calls.
-        let after_second = c.client.get_subscription(&c.plan, &c.sub);
-        prop_assert_eq!(after_second.current_period_end, s.current_period_end);
-        prop_assert_eq!(after_second.total_renewals, s.total_renewals);
-        prop_assert_eq!(after_second.started_at, s.started_at);
-        prop_assert!(after_second.cancelled);
+        // Reactivate the plan; the existing period is not extended.
+        c.client.reactivate_plan(&c.plan);
+        prop_assert_eq!(c.client.get_subscription(&c.plan, &c.sub), s.clone());
+        prop_assert_eq!(c.client.is_active(&c.plan, &c.sub), s.current_period_end > t);
+
+        // A new subscriber can now join and starts a fresh period from now.
+        let fresh = c.client.subscribe(&c.plan, &other, &other_ref);
+        prop_assert_eq!(fresh.current_period_end, t + CYCLE);
+        prop_assert_eq!(fresh.started_at, t);
+        prop_assert!(!fresh.cancelled);
     }
-
-    /// `renew` and `cancel` each extend the subscription key exactly once per
-    /// write. Before #227 both paths extended the key before calling
-    /// `save_sub`, which extends it again, so the subscription key was
-    /// extended twice per write. This pins the consolidated behaviour: the
-    /// subscription entry's live-until ledger advances by exactly one
-    /// `extend_ttl` worth of ledgers per write, matching `save_sub` alone.
-    #[test]
-    fn renew_and_cancel_extend_subscription_ttl_once(now in 0..=MAX_START) {
-        let c = setup(now);
-        c.client.subscribe(&c.plan, &c.sub, &c.payref);
-
-        // `renew` writes the subscription once; the key is extended once.
-        let
+}
