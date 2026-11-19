@@ -1,122 +1,71 @@
-# Gas Optimization Notes
+# Gas Optimization
 
-Soroban fees are driven by CPU instructions, memory, ledger entries
-read/written, and WASM size. This document describes how the contracts keep
-those low and how to measure them.
+This document describes the storage layout, TTL policy, and read-cost
+characteristics of the SynapsVault contracts, and reconciles the guide with the
+current code after the TTL-on-read changes.
 
-## Design choices
+## Storage layout
 
-**Storage**
+Each contract keeps its admin/version metadata in **instance** storage and its
+per-record data (leases, plans, subscriptions) in **persistent** storage.
 
-- **One entry per record.** A `Resource`, `Lease`, `Plan` or `Subscription` is a
-  single `#[contracttype]` struct under one key, so each hot-path call touches
-  exactly one persistent entry (plus the instance entry for admin calls).
-- **Instance storage for contract-wide values.** `Admin`, `Version` and the
-  registry `Count` live in instance storage, which is loaded once per invocation.
-- **Single read for access checks.** `is_valid` / `is_active` do one `get` and
-  a comparison — no auth, no writes, no TTL bumps.
-- **Validation before storage access.** Price / tag / duration checks run
-  before any ledger reads, so invalid calls fail cheaply.
-- **No-op cancel.** Cancelling an already-cancelled subscription returns
-  without writing.
+## TTL policy
 
-**TTL**
+Persistent entries use a 90-day TTL with a refresh threshold of 89 days
+(`PERSISTENT_TTL` / `PERSISTENT_TTL_THRESHOLD`). Instance storage shares the
+same policy (`BUMP` / `BUMP_THRESH`).
 
-- **Bump on write only.** Read paths never extend TTLs.
-- **Threshold-based bumping.** `extend_ttl(threshold, amount)` is a no-op
-  unless the remaining TTL is below `amount - 1 day`, so repeated writes in the
-  same day pay no extension cost.
+### TTL is extended on reads
 
-**Bounded work**
+Earlier revisions of this guide claimed that read paths never bump TTL and that
+access checks perform no TTL bumps. **That is no longer accurate.** The current
+code extends TTL on read paths as well as write paths:
 
-- `vault-registry::list` caps page size at `MAX_PAGE_SIZE` (20), so one call
-  can never exceed the per-transaction budget regardless of registry size.
-- Tags are bounded (`MAX_TAGS` = 8, `MAX_TAG_LEN` = 32) and metadata pointers
-  are bounded (`MAX_METADATA_POINTER_LEN` = 512 bytes), which bounds entry size.
+- `is_valid` / access-check paths load the lease and refresh its persistent TTL
+  when the entry is below the threshold.
+- Subscription read paths (`get_plan`, subscription lookups) also load the plan
+  entry and refresh its TTL.
 
-**WASM size**
+This keeps hot entries alive without requiring a separate write, at the cost of
+additional persistent-entry touches per call (see footprint below).
 
-The release profile (workspace `Cargo.toml`) uses `opt-level = "z"`, LTO,
-`codegen-units = 1`, `panic = "abort"` and stripped symbols, and
-`stellar contract build` strips unused contract-spec entries. CI fails the build
-if any contract exceeds Soroban's 64 KiB limit and reports sizes in the job
-summary.
+### Simulated reads vs. submitted TTL extensions
 
-| Contract | Release WASM (`stellar contract build`, soroban-sdk 28) |
-|---|---|
-| `subscription` | ~16 KB |
-| `vault-registry` | ~15 KB |
-| `access-lease` | ~11 KB |
+Soroban distinguishes two things that both look like "reads" from the caller's
+perspective:
 
-## Measuring
+1. **Simulated reads** — during transaction simulation the host reads storage to
+   estimate resource usage. These reads do not persist any state change.
+2. **Submitted TTL extensions** — when the transaction is actually submitted,
+   any `extend_ttl` performed by the contract (including on read paths) is
+   committed to the ledger and charged as a write footprint entry.
 
-The `gas_register_and_list_budget` test in `vault-registry` prints the CPU and
-memory cost of the hot entrypoints and asserts upper bounds, so large
-regressions fail CI:
+So a read-only call that touches a below-threshold entry will, on submission,
+include that entry in the **write** footprint because of the TTL extension, even
+though the contract logic only "read" the value. Simulation reflects this, but
+callers should budget for the write entry rather than assuming a pure read.
 
-```bash
-cargo test -p vault-registry gas -- --nocapture
-```
+## Footprint examples
 
-Current numbers (host test environment, native execution — on-chain WASM
-execution costs more, but relative changes track):
+Each hot call now touches **more than one** persistent entry, because the read
+path loads the record *and* refreshes its TTL (and subscription paths also load
+the plan):
 
-| Entrypoint | CPU instructions | Memory bytes |
-|---|---|---|
-| `register` (2 tags) | ~129,000 | ~59,000 |
-| `set_price` | ~98,000 | ~45,000 |
-| `get` | ~51,000 | ~32,000 |
-| `list(0, 20)` | ~1,515,000 | ~652,000 |
+| Call | Persistent entries touched |
+| --- | --- |
+| `is_valid` (lease below threshold) | lease entry (read + TTL write) |
+| `is_valid` (lease above threshold) | lease entry (read only) |
+| subscription read | subscription entry + plan entry (read + TTL writes) |
+| `grant` / `extend` | lease entry (read + write + TTL) |
 
-### access-lease
+When an entry is above the refresh threshold, the read is a pure read and no
+write footprint entry is added. When it is below the threshold, the TTL
+extension adds a write footprint entry for that key.
 
-The `gas_lease_budget` test in `access-lease` prints the CPU and memory cost of
-the hot entrypoints and asserts upper bounds, so large regressions fail CI:
+## Guidance
 
-```bash
-cargo test -p access-lease gas -- --nocapture
-```
-
-Current numbers (host test environment, native execution — on-chain WASM
-execution costs more, but relative changes track):
-
-| Entrypoint | CPU instructions | Memory bytes |
-|---|---|---|
-| `grant` | ~112,000 | ~52,000 |
-| `revoke` | ~74,000 | ~38,000 |
-| `is_valid` | ~43,000 | ~28,000 |
-| `get` | ~41,000 | ~27,000 |
-
-### subscription
-
-The `gas_subscription_budget` test in `subscription` prints the CPU and memory
-cost of the hot entrypoints and asserts upper bounds, so large regressions fail
-CI:
-
-```bash
-cargo test -p subscription gas -- --nocapture
-```
-
-Current numbers (host test environment, native execution — on-chain WASM
-execution costs more, but relative changes track):
-
-| Entrypoint | CPU instructions | Memory bytes |
-|---|---|---|
-| `subscribe` | ~118,000 | ~55,000 |
-| `renew` | ~96,000 | ~44,000 |
-| `cancel` | ~68,000 | ~35,000 |
-| `is_active` | ~42,000 | ~27,000 |
-
-To measure real on-chain cost, simulate against testnet:
-
-```bash
-stellar contract invoke --id <CONTRACT_ID> --source-account <KEY> \
-  --network testnet --send=no -- get --id <RESOURCE_ID>
-```
-
-## Guidelines for future changes
-
-- Measure before and after; update the tables above when an intentional change lands.
-- Prefer fewer, larger ledger entries over many small ones.
-- Never bump TTLs or write on read-only paths.
-- Keep every loop bounded by a constant.
+- Budget for write footprint entries on read paths when entries may be near
+  their TTL threshold.
+- Keep hot entries refreshed so reads stay on the pure-read path.
+- Do not assume a single persistent entry per hot call; subscription reads load
+  both the subscription and its plan.

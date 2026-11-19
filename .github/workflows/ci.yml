@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Check contractevent topics match docs/CONTRACTS.md
+      - name: Check contract event payloads match docs/CONTRACTS.md
         run: python3 scripts/check_events.py
 
   check-errors:
