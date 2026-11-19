@@ -120,10 +120,10 @@ The same concept can have a different code in each contract. Shared concepts:
 | Concept | vault-registry | access-lease | subscription |
 |---|---|---|---|
 | `AlreadyInitialised` | 8 | 7 | 9 |
-| `NotInitialised` | 7 | 5 | 9 |
+| `NotInitialised` | 7 | 5 | 8 |
 | `NotAdmin` | 6 (reserved) | 1 (reserved) | — |
-| `NotFound` | 2 | — (uses `LeaseNotFound`) | 2 |
-| `InvalidPrice` | 3 | — | 4 |
+| `NotFound` | 2 | — (uses `LeaseNotFound`) | 2 (`PlanNotFound`) |
+| `InvalidPrice` | 3 | — | 7 |
 | `InvalidResourceId` / `InvalidPlanId` | 10 (`InvalidResourceId`) | 9 (`InvalidResourceId`) | 12 (`InvalidPlanId`) |
 
 Notes:
@@ -512,9 +512,11 @@ for how they compare with the other contracts.
 | 3 | `AlreadyActive` | A non-expired lease already exists for the pair. |
 | 4 | `InvalidDuration` | Duration is zero or the resulting expiry overflows `u32`. |
 | 5 | `NotInitialised` | Admin-only call before `init`. |
-| 6 | `AlreadyInitialised` | `init` called twice. |
+| 7 | `AlreadyInitialised` | `init` called twice. |
 | 8 | `LeaseExpired` | The lease has already expired; there is nothing to revoke. |
 | 9 | `InvalidResourceId` | Resource id is empty or > 64 bytes. |
+| 10 | `NoPendingAdmin` | Admin acceptance called with no pending proposal. |
+| 11 | `NotPendingAdmin` | Address is not the proposed admin. |
 
 ---
 
@@ -633,14 +635,15 @@ for how they compare with the other contracts.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 2 | `NotFound` | No plan with `id`. |
-| 3 | `AlreadyExists` | `id` already registered. |
-| 4 | `InvalidPrice` | Price ≤ 0. |
-| 5 | `InvalidPeriod` | Period is zero or the resulting expiry overflows `u32`. |
-| 6 | `PlanInactive` | Plan is deactivated. |
-| 7 | `AlreadySubscribed` | Subscriber already has a subscription for the plan. |
-| 8 | `NotSubscribed` | No subscription for the pair. |
-| 9 | `NotInitialised` | Admin-only call before `init`. |
-| 10 | `AlreadyInitialised` | `init` called twice. |
+| 2 | `PlanNotFound` | No plan with `id`. |
+| 3 | `PlanInactive` | Plan is deactivated. |
+| 4 | `AlreadySubbed` | Subscriber already has a subscription for the plan. |
+| 5 | `SubNotFound` | No subscription for the pair. |
+| 6 | `Cancelled` | Subscription is already cancelled. |
+| 7 | `InvalidPrice` | Price ≤ 0. |
+| 8 | `NotInitialised` | Admin-only call before `init`. |
+| 9 | `AlreadyInitialised` | `init` called twice. |
+| 10 | `PlanExists` | Plan ID already registered. |
+| 11 | `Overflow` | Reserved error discriminant for overflow. |
 | 12 | `InvalidPlanId` | `plan_id` is empty or > 64 bytes. |
 | 13 | `SameAdmin` | The new admin address is the same as the current admin address. |
