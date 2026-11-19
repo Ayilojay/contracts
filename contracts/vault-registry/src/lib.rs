@@ -53,6 +53,20 @@ pub const MAX_TAGS: u32 = 8;
 /// no longer than this; violations are rejected with [`Error::InvalidTag`].
 pub const MAX_TAG_LEN: u32 = 32;
 
+/// Accepted tag alphabet: printable ASCII characters in the range `0x21..=0x7E`
+/// (all visible ASCII except space). Control bytes (0x00–0x1F, 0x7F) and
+/// whitespace (0x20) are rejected so that tags are safe to embed in URLs and
+/// log lines and cannot encode invisible payloads. Uppercase letters are
+/// accepted on input but normalised to lowercase before storage, so the
+/// effective stored alphabet is `[a-z0-9!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]`.
+///
+/// Any byte outside this range causes [`Error::InvalidTag`].
+#[inline]
+fn is_valid_tag_byte(b: u8) -> bool {
+    // Printable non-space ASCII: 0x21 ('!') through 0x7E ('~') inclusive.
+    b >= 0x21 && b <= 0x7E
+}
+
 /// Maximum page size returned by [`VaultRegistry::list`].
 pub const MAX_PAGE_SIZE: u32 = 20;
 /// Maximum byte length of a resource id. Ids must be non-empty and no longer
@@ -67,7 +81,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// - `id` is unique across the registry and immutable once registered.
 /// - `price` is strictly positive (in USDC stroops, 7 decimals).
 /// - `metadata.len() <= MAX_METADATA_POINTER_LEN`.
-/// - `tags.len() <= MAX_TAGS`, each tag non-empty and `<= MAX_TAG_LEN` bytes.
+/// - `tags.len() <= MAX_TAGS`, each tag non-empty, `<= MAX_TAG_LEN` bytes,
+///   and consisting solely of printable non-space ASCII (`0x21..=0x7E`).
+///   Control bytes and whitespace are rejected.
 /// - Only `creator` may mutate the resource (enforced via `require_auth`).
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -140,7 +156,9 @@ pub enum Error {
     InvalidPrice = 3,
     /// Metadata pointer exceeds [`MAX_METADATA_POINTER_LEN`].
     MetadataTooLong = 4,
-    /// Tags exceed [`MAX_TAGS`], a tag is empty or exceeds [`MAX_TAG_LEN`], or
+    /// Tags exceed [`MAX_TAGS`], a tag is empty or exceeds [`MAX_TAG_LEN`],
+    /// a tag contains a byte outside the accepted printable-ASCII alphabet
+    /// (`0x21..=0x7E`; control bytes and whitespace are rejected), or
     /// duplicate tags were supplied (after case-normalisation).
     InvalidTag = 5,
     /// The caller is not the configured admin.
@@ -374,8 +392,10 @@ impl VaultRegistry {
     /// - [`Error::MetadataEmpty`] if `metadata` is an empty string.
     /// - [`Error::MetadataTooLong`] if `metadata` exceeds
     ///   [`MAX_METADATA_POINTER_LEN`].
-    /// - [`Error::InvalidTag`] if `tags` exceed [`MAX_TAGS`], any tag is empty
-    ///   or exceeds [`MAX_TAG_LEN`], or duplicate tags are supplied (after
+    /// - [`Error::InvalidTag`] if `tags` exceed [`MAX_TAGS`], any tag is empty,
+    ///   exceeds [`MAX_TAG_LEN`], contains a byte outside the accepted
+    ///   printable-ASCII alphabet (`0x21..=0x7E`; control bytes and whitespace
+    ///   are rejected), or duplicate tags are supplied (after
     ///   case-normalisation).
     /// - [`Error::AlreadyRegistered`] if `id` already exists.
     ///
@@ -485,8 +505,10 @@ impl VaultRegistry {
     /// # Errors
     /// - [`Error::InvalidResourceId`] if `id` is empty or exceeds [`MAX_RESOURCE_ID_LEN`].
     /// - [`Error::NotFound`] if no resource exists with `id`.
-    /// - [`Error::InvalidTag`] if `tags` exceed [`MAX_TAGS`], any tag is empty
-    ///   or exceeds [`MAX_TAG_LEN`], or duplicate tags are supplied (after
+    /// - [`Error::InvalidTag`] if `tags` exceed [`MAX_TAGS`], any tag is empty,
+    ///   exceeds [`MAX_TAG_LEN`], contains a byte outside the accepted
+    ///   printable-ASCII alphabet (`0x21..=0x7E`; control bytes and whitespace
+    ///   are rejected), or duplicate tags are supplied (after
     ///   case-normalisation).
     pub fn set_tags(env: Env, id: String, tags: Vec<String>) -> Result<(), Error> {
         Self::validate_resource_id(&id)?;
@@ -910,6 +932,12 @@ impl VaultRegistry {
     /// tags are detected and rejected with [`Error::InvalidTag`] (fixes #73).
     /// The count and per-tag length limits are enforced before de-dup so that
     /// callers receive a fast early error on obviously-invalid input.
+    ///
+    /// **Character alphabet (fixes #195):** every byte of each tag must be a
+    /// printable non-space ASCII character in the range `0x21..=0x7E`. Control
+    /// bytes (0x00–0x1F, 0x7F) and whitespace (0x20) are rejected. Uppercase
+    /// letters are accepted and normalised to lowercase; the effective stored
+    /// alphabet is `[a-z0-9!-/:-@[-`{-~]`.
     fn validate_and_normalise_tags(env: &Env, tags: &Vec<String>) -> Result<Vec<String>, Error> {
         if tags.len() > MAX_TAGS {
             return Err(Error::InvalidTag);
@@ -923,11 +951,15 @@ impl VaultRegistry {
                 return Err(Error::InvalidTag);
             }
 
-            // Lower-case the tag byte-by-byte (ASCII only; Soroban Strings are
-            // arbitrary bytes but tags are documented as ASCII labels).
+            // Lower-case the tag byte-by-byte and enforce the accepted alphabet.
+            // Soroban Strings are arbitrary bytes but tags are documented as
+            // printable ASCII labels (fixes #195).
             let mut buf = [0u8; MAX_TAG_LEN as usize];
             tag.copy_into_slice(&mut buf[..len as usize]);
             for b in buf[..len as usize].iter_mut() {
+                if !is_valid_tag_byte(*b) {
+                    return Err(Error::InvalidTag);
+                }
                 if b.is_ascii_uppercase() {
                     *b = b.to_ascii_lowercase();
                 }
