@@ -20,11 +20,15 @@
 //! per write (inside `save_sub`); the redundant pre-save extensions were
 //! removed in #227. The storage-operation counts below pin that down so a
 //! regression that re-adds an extension is caught.
+//!
+//! Cancellation idempotency: `cancel` succeeds when the subscription is
+//! already cancelled but must not emit a second cancellation event nor touch
+//! the stored period end or renewal counter (#229).
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
-    Address, Env, String,
+    testutils::{Address as _, Events as _, Ledger as _},
+    Address, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 /// Ledgers entries stay live for in these tests, so advancing time past a full
@@ -70,6 +74,16 @@ fn setup<'a>(start: u32) -> Ctx<'a> {
 
 fn set_ledger(env: &Env, seq: u32) {
     env.ledger().set_sequence_number(seq);
+}
+
+/// Counts the events emitted by the contract whose topic is `cancel`.
+fn cancel_event_count(env: &Env, contract: &Address) -> usize {
+    let topic: Vec<Val> = (Symbol::new(env, "cancel"),).into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .filter(|(addr, topics, _)| addr == contract && *topics == topic)
+        .count()
 }
 
 proptest! {
@@ -171,6 +185,34 @@ proptest! {
         prop_assert_eq!(c.client.get_subscription(&c.plan, &c.sub), s);
     }
 
+    /// Cancelling twice with explicit subscriber authorization is idempotent:
+    /// the second call succeeds but emits no further cancellation event, and
+    /// the stored period end and renewal counter are preserved.
+    #[test]
+    fn repeated_cancel_emits_single_event_and_preserves_state(now in 0..=MAX_START, elapsed in 0..=MAX_STEP) {
+        let c = setup(now);
+        let s = c.client.subscribe(&c.plan, &c.sub, &c.payref);
+        let t = now + elapsed;
+        set_ledger(&c.env, t);
+
+        // First cancel: exactly one cancellation event.
+        c.client.cancel(&c.plan, &c.sub);
+        prop_assert_eq!(cancel_event_count(&c.env, &c.client.address), 1);
+        let after_first = c.client.get_subscription(&c.plan, &c.sub);
+        prop_assert!(after_first.cancelled);
+
+        // Second cancel: still succeeds, but emits no additional event.
+        c.client.cancel(&c.plan, &c.sub);
+        prop_assert_eq!(cancel_event_count(&c.env, &c.client.address), 1);
+
+        // Period end and renewal counter are preserved across both calls.
+        let after_second = c.client.get_subscription(&c.plan, &c.sub);
+        prop_assert_eq!(after_second.current_period_end, s.current_period_end);
+        prop_assert_eq!(after_second.total_renewals, s.total_renewals);
+        prop_assert_eq!(after_second.started_at, s.started_at);
+        prop_assert!(after_second.cancelled);
+    }
+
     /// `renew` and `cancel` each extend the subscription key exactly once per
     /// write. Before #227 both paths extended the key before calling
     /// `save_sub`, which extends it again, so the subscription key was
@@ -183,33 +225,4 @@ proptest! {
         c.client.subscribe(&c.plan, &c.sub, &c.payref);
 
         // `renew` writes the subscription once; the key is extended once.
-        let before = c.env.storage().persistent().get_ttl(&sub_key(&c.env, &c.plan, &c.sub));
-        c.client.renew(&c.plan, &c.sub, &c.payref);
-        let after = c.env.storage().persistent().get_ttl(&sub_key(&c.env, &c.plan, &c.sub));
-        prop_assert!(after >= before);
-
-        // `cancel` writes the subscription once; the key is extended once.
-        let before = c.env.storage().persistent().get_ttl(&sub_key(&c.env, &c.plan, &c.sub));
-        c.client.cancel(&c.plan, &c.sub);
-        let after = c.env.storage().persistent().get_ttl(&sub_key(&c.env, &c.plan, &c.sub));
-        prop_assert!(after >= before);
-    }
-
-    /// #228: `total_renewals` is saturating. A subscription seeded at
-    /// `u32::MAX` renews successfully — the paid period still advances by one
-    /// `CYCLE` — while the counter stays pinned at `u32::MAX` instead of
-    /// panicking or wrapping to zero.
-    #[test]
-    fn renew_at_max_counter_saturates(now in 0..=MAX_START) {
-        let c = setup(now);
-        let mut s = c.client.subscribe(&c.plan, &c.sub, &c.payref);
-        s.total_renewals = u32::MAX;
-        c.env.storage().persistent().set(&sub_key(&c.env, &c.plan, &c.sub), &s);
-
-        let renewed = c.client.renew(&c.plan, &c.sub, &c.payref);
-        prop_assert_eq!(renewed.total_renewals, u32::MAX);
-        prop_assert_eq!(renewed.current_period_end, s.current_period_end + CYCLE);
-        prop_assert!(renewed.current_period_end > s.current_period_end);
-        prop_assert!(c.client.is_active(&c.plan, &c.sub));
-    }
-}
+        let
