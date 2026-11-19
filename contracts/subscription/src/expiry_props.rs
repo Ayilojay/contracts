@@ -1,6 +1,6 @@
 //! Property tests for subscription expiry arithmetic (`subscribe`, `renew`,
-//! `cancel`, `is_active`). Each property is checked against a plain-integer
-//! model of the documented rules:
+//! `cancel`, `is_active`, `remaining_ledgers`). Each property is checked
+//! against a plain-integer model of the documented rules:
 //!
 //! - subscribe: `current_period_end = base + CYCLE`, where `base` is the
 //!   remaining paid period of a cancelled-but-active subscription, otherwise
@@ -9,6 +9,8 @@
 //!   or `Overflow`, leaving the stored subscription untouched.
 //! - active:    a subscription is active while `current_period_end > now`,
 //!   regardless of `cancelled`.
+//! - remaining: `current_period_end.saturating_sub(now)` ledgers of paid
+//!   access remain; `0` when there is no record or the period has lapsed.
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::{
@@ -158,5 +160,53 @@ proptest! {
             Err(Ok(Error::AlreadySubbed))
         );
         prop_assert_eq!(c.client.get_subscription(&c.plan, &c.sub), s);
+    }
+
+    /// `remaining_ledgers` reports the saturating distance to the period end
+    /// for an active subscription, and `0` once the period has lapsed.
+    #[test]
+    fn remaining_ledgers_matches_saturating_distance(now in 0..=MAX_START, elapsed in 0..=MAX_STEP) {
+        let c = setup(now);
+        let s = c.client.subscribe(&c.plan, &c.sub, &c.payref);
+        let t = now + elapsed;
+        set_ledger(&c.env, t);
+        prop_assert_eq!(
+            c.client.remaining_ledgers(&c.plan, &c.sub),
+            s.current_period_end.saturating_sub(t)
+        );
+    }
+
+    /// A cancelled-but-paid subscription still reports its remaining paid
+    /// ledgers until the period end, then `0`.
+    #[test]
+    fn remaining_ledgers_cancelled_but_paid(now in 0..=MAX_START, elapsed in 0..CYCLE) {
+        let c = setup(now);
+        let s = c.client.subscribe(&c.plan, &c.sub, &c.payref);
+        c.client.cancel(&c.plan, &c.sub);
+        let t = now + elapsed;
+        set_ledger(&c.env, t);
+        prop_assert_eq!(
+            c.client.remaining_ledgers(&c.plan, &c.sub),
+            s.current_period_end - t
+        );
+        set_ledger(&c.env, s.current_period_end);
+        prop_assert_eq!(c.client.remaining_ledgers(&c.plan, &c.sub), 0);
+    }
+
+    /// An expired subscription reports `0` remaining ledgers.
+    #[test]
+    fn remaining_ledgers_expired_is_zero(now in 0..=MAX_START, elapsed in CYCLE..=MAX_STEP) {
+        let c = setup(now);
+        let s = c.client.subscribe(&c.plan, &c.sub, &c.payref);
+        set_ledger(&c.env, now + elapsed);
+        prop_assert!(s.current_period_end <= now + elapsed);
+        prop_assert_eq!(c.client.remaining_ledgers(&c.plan, &c.sub), 0);
+    }
+
+    /// A subscriber with no record reports `0` remaining ledgers.
+    #[test]
+    fn remaining_ledgers_missing_record_is_zero(now in 0..=MAX_START) {
+        let c = setup(now);
+        prop_assert_eq!(c.client.remaining_ledgers(&c.plan, &c.sub), 0);
     }
 }
