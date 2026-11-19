@@ -277,11 +277,5 @@ MIT © 2025 Busiii-adetiba
 <!-- handsoff-issue-116 -->
 - #116: [docs and tooling] Doc comments on Lease, Subscription and Plan use "30-day" and "ledgers" interchangeably; state the conversi...
 
-<!-- handsoff-issue-237 -->
-- #237: [docs] Describe subscription APIs that are actually exported
-
-<!-- handsoff-issue-238 -->
-- #238: [docs] Correct retirement event data and registry initialization requirements
-
-<!-- handsoff-issue-239 -->
-- #239: [docs] Update event encoding conventions for vector payloads
+<!-- handsoff-issue-232 -->
+- #232: [subscription] Expose the billing cycle length through the contract interface
