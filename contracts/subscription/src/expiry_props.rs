@@ -10,6 +10,12 @@
 //! - active:    a subscription is active while `current_period_end > now`,
 //!   regardless of `cancelled`.
 //!
+//! Renewal counter: `total_renewals` is **saturating**. It counts renewals up
+//! to `u32::MAX` and then stays pinned there; a renewal at the maximum still
+//! extends the paid period (the counter is informational, not a gate). This is
+//! the explicit overflow policy for #228: no panic, no wrap, no `Overflow`
+//! error — the counter simply stops counting while renewals keep working.
+//!
 //! TTL handling: `renew` and `cancel` extend the subscription key exactly once
 //! per write (inside `save_sub`); the redundant pre-save extensions were
 //! removed in #227. The storage-operation counts below pin that down so a
@@ -187,5 +193,23 @@ proptest! {
         c.client.cancel(&c.plan, &c.sub);
         let after = c.env.storage().persistent().get_ttl(&sub_key(&c.env, &c.plan, &c.sub));
         prop_assert!(after >= before);
+    }
+
+    /// #228: `total_renewals` is saturating. A subscription seeded at
+    /// `u32::MAX` renews successfully — the paid period still advances by one
+    /// `CYCLE` — while the counter stays pinned at `u32::MAX` instead of
+    /// panicking or wrapping to zero.
+    #[test]
+    fn renew_at_max_counter_saturates(now in 0..=MAX_START) {
+        let c = setup(now);
+        let mut s = c.client.subscribe(&c.plan, &c.sub, &c.payref);
+        s.total_renewals = u32::MAX;
+        c.env.storage().persistent().set(&sub_key(&c.env, &c.plan, &c.sub), &s);
+
+        let renewed = c.client.renew(&c.plan, &c.sub, &c.payref);
+        prop_assert_eq!(renewed.total_renewals, u32::MAX);
+        prop_assert_eq!(renewed.current_period_end, s.current_period_end + CYCLE);
+        prop_assert!(renewed.current_period_end > s.current_period_end);
+        prop_assert!(c.client.is_active(&c.plan, &c.sub));
     }
 }
