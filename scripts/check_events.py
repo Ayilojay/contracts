@@ -7,6 +7,10 @@ tables documented in docs/CONTRACTS.md. Topic-name-only comparison is not
 enough: a wrong payload table (e.g. the retirement event) would otherwise
 pass silently.
 
+Duplicate rows and duplicate discriminator definitions are reported with
+source locations before any set comparison, so they cannot be silently
+discarded.
+
 Usage:
     python3 scripts/check_events.py
 
@@ -62,14 +66,36 @@ def _normalise_type(ty: str) -> str:
     return re.sub(r"\s+", " ", ty.strip())
 
 
-def parse_rust_events(source: str) -> dict[str, EventSpec]:
-    """Return {event_name: EventSpec} parsed from a Rust source file."""
+def _line_of(source: str, offset: int) -> int:
+    return source.count("\n", 0, offset) + 1
+
+
+def parse_rust_events(
+    source: str, origin: str = "<source>"
+) -> tuple[dict[str, EventSpec], list[str]]:
+    """Return ({event_name: EventSpec}, duplicate_errors) from a Rust file.
+
+    Duplicate discriminator definitions (the same event name declared more
+    than once) are reported with their source locations instead of being
+    silently overwritten.
+    """
 
     events: dict[str, EventSpec] = {}
+    seen_at: dict[str, int] = {}
+    duplicates: list[str] = []
     for match in CONTRACT_EVENT_RE.finditer(source):
         name = match.group("name")
         body = match.group("body")
         header = source[match.start() : match.start("body")]
+        line = _line_of(source, match.start())
+
+        if name in seen_at:
+            duplicates.append(
+                f"duplicate event definition `{name}` at {origin}:{line} "
+                f"(first defined at {origin}:{seen_at[name]})"
+            )
+            continue
+        seen_at[name] = line
 
         fmt_match = DATA_FORMAT_RE.search(header)
         data_format = fmt_match.group("fmt") if fmt_match else "single-value"
@@ -89,7 +115,7 @@ def parse_rust_events(source: str) -> dict[str, EventSpec]:
                 else:
                     spec.data.append(entry)
         events[name] = spec
-    return events
+    return events, duplicates
 
 
 # ---------------------------------------------------------------------------
@@ -114,10 +140,16 @@ TABLE_ROW_RE = re.compile(
 DOC_DATA_FORMAT_RE = re.compile(r"data_format\s*:\s*(?P<fmt>[\w-]+)", re.IGNORECASE)
 
 
-def parse_doc_events(text: str) -> dict[str, EventSpec]:
-    """Return {event_name: EventSpec} parsed from docs/CONTRACTS.md."""
+def parse_doc_events(text: str) -> tuple[dict[str, EventSpec], list[str]]:
+    """Return ({event_name: EventSpec}, duplicate_errors) from the docs.
+
+    Duplicate event sections and duplicate rows within a section are reported
+    with their line numbers before any set comparison.
+    """
 
     events: dict[str, EventSpec] = {}
+    seen_at: dict[str, int] = {}
+    duplicates: list[str] = []
     headings = list(EVENT_HEADING_RE.finditer(text))
     for idx, heading in enumerate(headings):
         name = heading.group("name")
@@ -129,18 +161,41 @@ def parse_doc_events(text: str) -> dict[str, EventSpec]:
         if not rows:
             continue
 
+        heading_line = _line_of(text, heading.start())
+        if name in seen_at:
+            duplicates.append(
+                f"duplicate event section `{name}` at docs/CONTRACTS.md:{heading_line} "
+                f"(first documented at docs/CONTRACTS.md:{seen_at[name]})"
+            )
+            continue
+        seen_at[name] = heading_line
+
         fmt_match = DOC_DATA_FORMAT_RE.search(section)
         spec = EventSpec(
             data_format=fmt_match.group("fmt") if fmt_match else "single-value"
         )
+        row_seen: dict[tuple[str, str], int] = {}
         for row in rows:
-            entry = f"{row.group('field').strip()}: {_normalise_type(row.group('ty'))}"
-            if row.group("kind").lower() == "topic":
+            kind = row.group("kind").lower()
+            field_name = row.group("field").strip()
+            row_line = _line_of(text, start + row.start())
+            key = (kind, field_name)
+            if key in row_seen:
+                duplicates.append(
+                    f"duplicate {kind} row `{field_name}` for event `{name}` at "
+                    f"docs/CONTRACTS.md:{row_line} "
+                    f"(first listed at docs/CONTRACTS.md:{row_seen[key]})"
+                )
+                continue
+            row_seen[key] = row_line
+
+            entry = f"{field_name}: {_normalise_type(row.group('ty'))}"
+            if kind == "topic":
                 spec.topics.append(entry)
             else:
                 spec.data.append(entry)
         events[name] = spec
-    return events
+    return events, duplicates
 
 
 # ---------------------------------------------------------------------------
@@ -175,11 +230,17 @@ def compare(
     return errors
 
 
-def collect_source_events() -> dict[str, EventSpec]:
+def collect_source_events() -> tuple[dict[str, EventSpec], list[str]]:
     events: dict[str, EventSpec] = {}
+    duplicates: list[str] = []
     for path in sorted(CONTRACTS_DIR.rglob("*.rs")):
-        events.update(parse_rust_events(path.read_text(encoding="utf-8")))
-    return events
+        origin = str(path.relative_to(ROOT))
+        parsed, dup_errors = parse_rust_events(
+            path.read_text(encoding="utf-8"), origin=origin
+        )
+        events.update(parsed)
+        duplicates.extend(dup_errors)
+    return events, duplicates
 
 
 def main() -> int:
@@ -187,8 +248,15 @@ def main() -> int:
         print(f"error: {DOCS} not found", file=sys.stderr)
         return 1
 
-    source_events = collect_source_events()
-    doc_events = parse_doc_events(DOCS.read_text(encoding="utf-8"))
+    source_events, source_dups = collect_source_events()
+    doc_events, doc_dups = parse_doc_events(DOCS.read_text(encoding="utf-8"))
+
+    duplicates = source_dups + doc_dups
+    if duplicates:
+        print("Duplicate event definitions detected:", file=sys.stderr)
+        for dup in duplicates:
+            print(f"  - {dup}", file=sys.stderr)
+        return 1
 
     errors = compare(source_events, doc_events)
     if errors:
