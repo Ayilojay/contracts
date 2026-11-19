@@ -40,6 +40,13 @@ Contract mapping
         vault-registry  → contracts/vault-registry/src/lib.rs
         access-lease    → contracts/access-lease/src/lib.rs
         subscription    → contracts/subscription/src/lib.rs
+
+Error-code cross-reference (issue #236)
+    The shared error-code table in ``docs/CONTRACTS.md`` documents numeric
+    values for each contract's error enum.  This script also parses the Rust
+    ``#[contracterror]`` enums and verifies that every documented value matches
+    the enum definition, so stale examples (e.g. subscription ``NotInitialised``
+    or ``InvalidPrice``) are caught in CI.
 """
 
 import re
@@ -73,6 +80,20 @@ _RE_RUST_EVENT = re.compile(
 # Captures the first quoted word inside the parens.
 _RE_DOCS_TOPIC = re.compile(
     r'`\(\s*"([^"]+)"'
+)
+
+# Matches a Rust enum variant with an explicit discriminant, e.g.
+#     NotInitialised = 8,
+# Captures the variant name and the numeric value.
+_RE_RUST_ERROR_VARIANT = re.compile(
+    r'^\s*([A-Z][A-Za-z0-9_]*)\s*=\s*(\d+)\s*,?\s*$'
+)
+
+# Matches a docs error-code row, e.g.
+#     | `NotInitialised` | 8 | ... |
+# Captures the variant name and the documented numeric value.
+_RE_DOCS_ERROR_ROW = re.compile(
+    r'`([A-Z][A-Za-z0-9_]*)`\s*\|\s*(\d+)\b'
 )
 
 # ---------------------------------------------------------------------------
@@ -129,6 +150,66 @@ def extract_docs_sections(path: Path) -> dict[str, list[str]]:
     return sections
 
 
+def extract_rust_error_codes(path: Path) -> dict[str, int]:
+    """Return ``{variant: value}`` for the ``#[contracterror]`` enum in *path*.
+
+    Only variants with an explicit numeric discriminant are captured; the
+    ``#[contracterror]`` attribute is used to locate the enum so unrelated
+    enums in the same file are ignored.
+    """
+    text = path.read_text(encoding="utf-8")
+    codes: dict[str, int] = {}
+
+    # Find the enum that follows a #[contracterror] attribute.
+    m_attr = re.search(r'#\[contracterror\]', text)
+    if not m_attr:
+        return codes
+
+    m_enum = re.search(r'\benum\s+[A-Za-z0-9_]+\s*\{', text[m_attr.end():])
+    if not m_enum:
+        return codes
+
+    body_start = m_attr.end() + m_enum.end()
+    depth = 1
+    i = body_start
+    while i < len(text) and depth > 0:
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+        i += 1
+    body = text[body_start:i - 1]
+
+    for line in body.splitlines():
+        m = _RE_RUST_ERROR_VARIANT.match(line)
+        if m:
+            codes[m.group(1)] = int(m.group(2))
+
+    return codes
+
+
+def extract_docs_error_codes(path: Path) -> dict[str, int]:
+    """Return ``{variant: value}`` from the shared error-code table in *path*.
+
+    The shared table is the one under the ``### Error codes`` heading (or any
+    heading containing ``Error``) that lists ``| `Variant` | N |`` rows.
+    """
+    codes: dict[str, int] = {}
+    in_error_table = False
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if re.match(r"^#{1,6}\s", line):
+            in_error_table = bool(re.search(r"error", line, re.IGNORECASE))
+            continue
+
+        if in_error_table:
+            m = _RE_DOCS_ERROR_ROW.search(line)
+            if m:
+                codes[m.group(1)] = int(m.group(2))
+
+    return codes
+
+
 # ---------------------------------------------------------------------------
 # Main comparison logic
 # ---------------------------------------------------------------------------
@@ -169,6 +250,23 @@ def check() -> int:
 
         if not missing_from_docs and not missing_from_rust:
             print(f"[{slug}] OK — {len(rust_topics)} event(s) match")
+
+    # Cross-reference documented error codes against the Rust enums.
+    docs_error_codes = extract_docs_error_codes(CONTRACTS_MD)
+    for slug, src_path in CONTRACT_MAP.items():
+        if not src_path.exists():
+            continue
+
+        rust_codes = extract_rust_error_codes(src_path)
+        for variant, value in sorted(rust_codes.items()):
+            if variant not in docs_error_codes:
+                continue
+            documented = docs_error_codes[variant]
+            if documented != value:
+                errors.append(
+                    f"[{slug}] error code `{variant}` is documented as "
+                    f"{documented} in docs/CONTRACTS.md but the enum defines {value}"
+                )
 
     if errors:
         print("\nEvent table drift detected:\n", file=sys.stderr)
