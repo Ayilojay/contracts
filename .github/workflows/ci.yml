@@ -165,7 +165,11 @@ jobs:
   build:
     name: Build WASM
     runs-on: ubuntu-latest
-    needs: [lint, test, test-workspace]
+    # Artifact production is gated on the complete validation set: lint, tests,
+    # docs/event/error sync checks, and the dependency audit. GitHub Actions
+    # skips this job (and its artifact upload) if any prerequisite fails or is
+    # skipped, so a failed check prevents WASM artifacts from being produced.
+    needs: [lint, test, test-workspace, check-events, check-errors, audit]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
