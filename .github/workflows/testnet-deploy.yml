@@ -107,9 +107,19 @@ jobs:
 
       - name: Fund accounts
         run: |
+          set -euo pipefail
           stellar keys add deployer --secret-key <<< "$DEPLOYER_SECRET" >/dev/null 2>&1 || true
-          DEPLOYER_PUB=$(stellar keys address deployer 2>/dev/null \
-            || echo "GCJH6RF7EU7LRXZK3QPJD2XZ7ZL7GI67WUPVRWROJ6XDEJKHIKW7GFWX")
+          # Derive the deployer public address from the configured identity.
+          # Stop the job if derivation fails — never fall back to a hard-coded address.
+          if ! DEPLOYER_PUB=$(stellar keys address deployer); then
+            echo "::error::Failed to derive deployer public address from configured deployer identity. Aborting."
+            exit 1
+          fi
+          if [ -z "$DEPLOYER_PUB" ]; then
+            echo "::error::Derived deployer public address is empty. Aborting."
+            exit 1
+          fi
+          echo "::notice::Deployer public address: $DEPLOYER_PUB"
           # Required accounts (validated in check-secrets) plus optional funding-only accounts.
           for ADDR in "$DEPLOYER_PUB" "$BACKEND_PUBLIC" "$PUBLISHER1_PUBLIC" "$PUBLISHER2_PUBLIC"; do
             if [ -z "$ADDR" ]; then
@@ -213,7 +223,6 @@ jobs:
           echo "| Contract | ID | Version |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| vault-registry | \`$VAULT_REGISTRY\` | \`$VAULT_REGISTRY_VERSION\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| access-lease   | \`$ACCESS_LEASE\` | \`$ACCESS_LEASE_VERSION\` |"   >> $GITHUB_STEP_SUMMARY
-          echo "| subscription   | \`$SUBSCRIPTION\` | \`$SUBSCRIPTION_VERSION\` |"   >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "[View on Stellar Expert →](https://stellar.expert/explorer/testnet/contract/$VAULT_REGISTRY)" >> $GITHUB_STEP_SUMMARY
+          echo "| access-lease   | \`$ACCESS_LEASE\` | \`$ACCESS_LEASE_VERSION\`
+
+/* … truncated 316 chars — edit only what you need near the top … */
