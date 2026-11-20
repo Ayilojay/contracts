@@ -77,6 +77,28 @@ jobs:
             --rpc-url "$RPC_URL" \
             --network-passphrase "$NETWORK_PASSPHRASE" 2>/dev/null || true
 
+      - name: Verify required accounts exist
+        run: |
+          set -euo pipefail
+          # Required accounts must already be funded on mainnet; friendbot is not
+          # available here, so we only verify existence with bounded retries.
+          MAX_ATTEMPTS=5
+          BACKOFF=3
+          for ACCOUNT in "$ADMIN_PUBLIC"; do
+            attempt=1
+            until stellar account show --account "$ACCOUNT" --network "$NETWORK" >/dev/null 2>&1; do
+              if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+                echo "::error::Required account $ACCOUNT not found after $MAX_ATTEMPTS attempts"
+                exit 1
+              fi
+              echo "::warning::Account $ACCOUNT not ready (attempt $attempt/$MAX_ATTEMPTS); retrying in ${BACKOFF}s"
+              sleep "$BACKOFF"
+              attempt=$((attempt + 1))
+              BACKOFF=$((BACKOFF * 2))
+            done
+            echo "::notice::Required account $ACCOUNT verified"
+          done
+
       - name: Deploy + init contracts
         run: |
           set -euo pipefail
