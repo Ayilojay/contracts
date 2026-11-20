@@ -282,3 +282,6 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-191 -->
 - #191: [vault-registry] Stop full listing scans at the recorded resource count
+
+<!-- handsoff-issue-192 -->
+- #192: [vault-registry] Make registration counter exhaustion explicit
