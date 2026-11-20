@@ -282,3 +282,6 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-187 -->
 - #187: [vault-registry] Normalize tag filters using the storage normalization rule
+
+<!-- handsoff-issue-188 -->
+- #188: [vault-registry] Add a pending ownership proposal getter
