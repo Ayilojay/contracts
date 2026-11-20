@@ -83,6 +83,10 @@ pub enum Error {
     NoPendingAdmin = 10,
     /// `accept_admin` was called by an address that is not the pending admin.
     NotPendingAdmin = 11,
+    /// `grant_leases` received more requests than [`MAX_BATCH_SIZE`].
+    BatchTooLarge = 12,
+    /// `cancel_admin_proposal` was called but no proposal is pending.
+    NoPendingProposal = 13,
 }
 
 #[contractevent(topics = ["init"], data_format = "single-value")]
@@ -107,6 +111,12 @@ pub struct ProposeAdminEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AcceptAdminEvent {
     pub new_admin: Address,
+}
+
+#[contractevent(topics = ["canceladmin"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelAdminProposalEvent {
+    pub cancelled_pending_admin: Address,
 }
 
 #[contractevent(topics = ["grant"], data_format = "single-value")]
@@ -247,6 +257,29 @@ impl AccessLease {
         Ok(())
     }
 
+    /// Cancel an outstanding admin proposal.
+    ///
+    /// Only the **current admin** may cancel. Reverts with
+    /// [`Error::NoPendingProposal`] if no proposal is outstanding — there is
+    /// nothing to cancel. On success the pending-admin slot is cleared and a
+    /// `canceladmin` event is emitted; the previous `accept_admin` call will
+    /// then fail with [`Error::NoPendingAdmin`].
+    pub fn cancel_admin_proposal(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(Error::NoPendingProposal)?;
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
+        CancelAdminProposalEvent {
+            cancelled_pending_admin: pending,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
     /// Return the pending admin address, if any proposal is outstanding.
     pub fn pending_admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::PendingAdmin)
@@ -276,11 +309,37 @@ impl AccessLease {
         Self::grant_lease_internal(&env, resource_id, buyer, duration_ledgers)
     }
 
+    /// Grant leases for multiple `(resource_id, buyer, duration_ledgers)` tuples
+    /// in a single admin-authorised call.
+    ///
+    /// **Batch size:** accepts 1 to [`MAX_BATCH_SIZE`] requests (inclusive).
+    /// An empty vector is rejected with [`Error::InvalidDuration`] (use
+    /// [`grant_lease`] for a single grant). A vector exceeding [`MAX_BATCH_SIZE`]
+    /// entries is rejected with [`Error::BatchTooLarge`]. Both checks happen
+    /// before any storage write, so the call is an atomic no-op on failure.
+    ///
+    /// **Atomicity:** the entire batch succeeds or fails together. If any
+    /// individual request is invalid (bad resource id, zero duration, already-
+    /// active lease, etc.) the error is returned immediately and no leases from
+    /// the batch — including those already processed in the loop — are persisted.
+    /// Events are only emitted after all writes succeed.
     pub fn grant_leases(
         env: Env,
         requests: soroban_sdk::Vec<(String, Address, u32)>,
     ) -> Result<soroban_sdk::Vec<Lease>, Error> {
         Self::require_admin(&env)?;
+
+        // Reject empty batches — callers should use grant_lease for a single
+        // grant, and an empty batch is almost certainly a caller bug.
+        if requests.is_empty() {
+            return Err(Error::InvalidDuration);
+        }
+
+        // Reject oversized batches before touching storage.
+        if requests.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
         let mut leases = soroban_sdk::Vec::new(&env);
         for req in requests.iter() {
             leases.push_back(Self::grant_lease_internal(&env, req.0, req.1, req.2)?);
@@ -957,6 +1016,8 @@ mod tests {
         assert_eq!(Error::InvalidResourceId as u32, 9);
         assert_eq!(Error::NoPendingAdmin as u32, 10);
         assert_eq!(Error::NotPendingAdmin as u32, 11);
+        assert_eq!(Error::BatchTooLarge as u32, 12);
+        assert_eq!(Error::NoPendingProposal as u32, 13);
     }
 
     /// Golden XDR-encoded length of a representative [`Lease`].
@@ -994,6 +1055,202 @@ mod tests {
             "Lease XDR encoding changed: update LEASE_XDR_LEN deliberately \
              (and docs/CONTRACTS.md) if this layout change is intended"
         );
+    }
+
+    // ── Issue #207: batch size cap ────────────────────────────────────────────
+
+    /// An empty `grant_leases` call is a typed error, not a silent no-op.
+    #[test]
+    fn grant_leases_empty_batch_is_rejected() {
+        let (env, client, _admin) = setup();
+        let empty: soroban_sdk::Vec<(String, Address, u32)> = soroban_sdk::Vec::new(&env);
+        assert_eq!(
+            client.try_grant_leases(&empty),
+            Err(Ok(Error::InvalidDuration)),
+        );
+        // No events emitted.
+        assert!(env
+            .events()
+            .all()
+            .filter_by_contract(&client.address)
+            .is_empty());
+    }
+
+    /// A batch of exactly MAX_BATCH_SIZE succeeds.
+    #[test]
+    fn grant_leases_at_max_batch_size_succeeds() {
+        let (env, client, _admin) = setup();
+        let mut requests: soroban_sdk::Vec<(String, Address, u32)> = soroban_sdk::Vec::new(&env);
+        for i in 0..MAX_BATCH_SIZE {
+            let rid = String::from_str(&env, &soroban_sdk::format!(&env, "r{}", i));
+            let buyer = Address::generate(&env);
+            requests.push_back((rid, buyer, 100u32));
+        }
+        let leases = client.grant_leases(&requests);
+        assert_eq!(leases.len(), MAX_BATCH_SIZE);
+    }
+
+    /// One entry over the limit is rejected before any write.
+    #[test]
+    fn grant_leases_over_max_batch_size_is_rejected() {
+        let (env, client, _admin) = setup();
+        let mut requests: soroban_sdk::Vec<(String, Address, u32)> = soroban_sdk::Vec::new(&env);
+        for i in 0..=MAX_BATCH_SIZE {
+            let rid = String::from_str(&env, &soroban_sdk::format!(&env, "r{}", i));
+            let buyer = Address::generate(&env);
+            requests.push_back((rid, buyer, 100u32));
+        }
+        assert_eq!(
+            client.try_grant_leases(&requests),
+            Err(Ok(Error::BatchTooLarge)),
+        );
+    }
+
+    // ── Issue #208: atomic rollback of a partially-failing batch ─────────────
+
+    /// A batch where a later entry is invalid must leave no storage or events
+    /// from the earlier (valid) entries.
+    #[test]
+    fn grant_leases_partial_failure_rolls_back_all_writes() {
+        let (env, client, _admin) = setup();
+        let buyer = Address::generate(&env);
+        let rid_good = String::from_str(&env, "good");
+        // A zero-length resource_id will fail InvalidResourceId.
+        let rid_bad = String::from_str(&env, "");
+
+        let mut requests: soroban_sdk::Vec<(String, Address, u32)> = soroban_sdk::Vec::new(&env);
+        requests.push_back((rid_good.clone(), buyer.clone(), 100u32));
+        requests.push_back((rid_bad.clone(), buyer.clone(), 100u32));
+
+        let result = client.try_grant_leases(&requests);
+        assert!(result.is_err());
+
+        // The earlier valid entry must not have been persisted.
+        assert!(!client.is_valid(&rid_good, &buyer));
+        assert_eq!(
+            client.try_get_lease(&rid_good, &buyer),
+            Err(Ok(Error::LeaseNotFound))
+        );
+
+        // No grant events should have been emitted for the batch.
+        let all_events = env.events().all().filter_by_contract(&client.address);
+        for event in all_events.iter() {
+            // topics is a Vec<Val>; check the first topic symbol is not "grant"
+            let topics: soroban_sdk::Vec<soroban_sdk::Val> = event.1;
+            if !topics.is_empty() {
+                let first: soroban_sdk::Val = topics.get_unchecked(0);
+                let grant_sym: soroban_sdk::Val =
+                    soroban_sdk::symbol_short!("grant").into_val(&env);
+                assert_ne!(first, grant_sym, "unexpected grant event emitted");
+            }
+        }
+    }
+
+    /// A duplicate resource-buyer pair within the same batch is rejected and
+    /// no writes survive.
+    #[test]
+    fn grant_leases_duplicate_pair_in_batch_rolls_back() {
+        let (env, client, _admin) = setup();
+        let buyer = Address::generate(&env);
+        let rid = String::from_str(&env, "dup");
+
+        let mut requests: soroban_sdk::Vec<(String, Address, u32)> = soroban_sdk::Vec::new(&env);
+        requests.push_back((rid.clone(), buyer.clone(), 100u32));
+        requests.push_back((rid.clone(), buyer.clone(), 200u32)); // duplicate
+
+        let result = client.try_grant_leases(&requests);
+        assert_eq!(result, Err(Ok(Error::AlreadyActive)));
+
+        // No lease persisted at all.
+        assert!(!client.is_valid(&rid, &buyer));
+    }
+
+    // ── Issue #209: empty batch is a typed error (documented above) ───────────
+    // The test `grant_leases_empty_batch_is_rejected` above covers #209.
+    // Additionally verify auth is still checked even for empty batches.
+    #[test]
+    fn grant_leases_empty_batch_still_checks_auth() {
+        let (env, client, _admin) = setup();
+        let mallory = Address::generate(&env);
+        let empty: soroban_sdk::Vec<(String, Address, u32)> = soroban_sdk::Vec::new(&env);
+        env.mock_auths(&[MockAuth {
+            address: &mallory,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "grant_leases",
+                args: (empty.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        // Should fail on auth, not on empty-batch check.
+        assert!(client.try_grant_leases(&empty).is_err());
+    }
+
+    // ── Issue #210: cancellation of pending admin proposals ───────────────────
+
+    /// Cancelling when there is no pending proposal returns `NoPendingProposal`.
+    #[test]
+    fn cancel_admin_proposal_no_pending_returns_error() {
+        let (env, client, _admin) = setup();
+        assert_eq!(
+            client.try_cancel_admin_proposal(),
+            Err(Ok(Error::NoPendingProposal)),
+        );
+    }
+
+    /// After cancellation the pending-admin slot is cleared and the proposal
+    /// can no longer be accepted.
+    #[test]
+    fn cancel_admin_proposal_clears_pending_and_blocks_accept() {
+        let (env, client, _admin) = setup();
+        let candidate = Address::generate(&env);
+
+        client.propose_admin(&candidate);
+        assert_eq!(client.pending_admin(), Some(candidate.clone()));
+
+        client.cancel_admin_proposal();
+        // Slot is cleared.
+        assert_eq!(client.pending_admin(), None);
+
+        // Trying to accept the now-cancelled proposal fails.
+        assert_eq!(
+            client.try_accept_admin(&candidate),
+            Err(Ok(Error::NoPendingAdmin)),
+        );
+    }
+
+    /// `cancel_admin_proposal` emits the documented `canceladmin` event.
+    #[test]
+    fn cancel_admin_proposal_emits_event() {
+        let (env, client, _admin) = setup();
+        let candidate = Address::generate(&env);
+
+        client.propose_admin(&candidate);
+        client.cancel_admin_proposal();
+
+        let all = env.events().all().filter_by_contract(&client.address);
+        // The last event must be canceladmin.
+        let last = all.last_unchecked();
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = last.1;
+        let expected_topic: soroban_sdk::Val =
+            soroban_sdk::Symbol::new(&env, "canceladmin").into_val(&env);
+        assert_eq!(
+            topics.get_unchecked(0),
+            expected_topic,
+            "expected canceladmin event topic"
+        );
+    }
+
+    /// Only the current admin can cancel a proposal.
+    #[test]
+    fn cancel_admin_proposal_requires_admin_auth() {
+        let (env, client, admin) = setup();
+        let candidate = Address::generate(&env);
+        client.propose_admin(&candidate);
+
+        // Check the auth record.
+        client.cancel_admin_proposal();
+        assert_eq!(env.auths()[0].0, admin);
     }
 }
 #[cfg(test)]

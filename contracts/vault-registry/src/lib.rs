@@ -448,6 +448,8 @@ impl VaultRegistry {
     /// Update a resource's price.
     ///
     /// Only the creator may call this (enforced via `require_auth`).
+    /// If `new_price` equals the currently stored price the call is a no-op
+    /// (no storage write, no event emitted) after authorization and validation.
     ///
     /// # Errors
     /// - [`Error::InvalidResourceId`] if `id` is empty or exceeds [`MAX_RESOURCE_ID_LEN`].
@@ -460,6 +462,10 @@ impl VaultRegistry {
             return Err(Error::InvalidPrice);
         }
         resource.creator.require_auth();
+        // #201: no-op when the price is already the stored value.
+        if resource.price == new_price {
+            return Ok(());
+        }
         resource.price = new_price;
         Self::save(&env, &resource);
         SetPriceEvent {
@@ -473,6 +479,8 @@ impl VaultRegistry {
     /// Update a resource's metadata pointer.
     ///
     /// Only the creator may call this (enforced via `require_auth`).
+    /// If `metadata` equals the currently stored pointer the call is a no-op
+    /// (no storage write, no event emitted) after authorization and validation.
     ///
     /// # Errors
     /// - [`Error::InvalidResourceId`] if `id` is empty or exceeds [`MAX_RESOURCE_ID_LEN`].
@@ -485,6 +493,10 @@ impl VaultRegistry {
         let mut resource = Self::load(&env, &id)?;
         resource.creator.require_auth();
         Self::validate_metadata_pointer(&metadata)?;
+        // #199: no-op when the pointer is already the stored value.
+        if resource.metadata == metadata {
+            return Ok(());
+        }
         resource.metadata = metadata.clone();
         Self::save(&env, &resource);
         UpdateMetadataEvent {
@@ -502,6 +514,11 @@ impl VaultRegistry {
     /// to lowercase before storage; duplicate tags (after normalisation) are
     /// rejected.
     ///
+    /// If the normalised tag vector is identical to the currently stored vector
+    /// (including when an uppercase-equivalent input normalises to the same
+    /// stored tags) the call is a no-op (no storage write, no event emitted)
+    /// after authorization and validation.
+    ///
     /// # Errors
     /// - [`Error::InvalidResourceId`] if `id` is empty or exceeds [`MAX_RESOURCE_ID_LEN`].
     /// - [`Error::NotFound`] if no resource exists with `id`.
@@ -515,6 +532,10 @@ impl VaultRegistry {
         let mut resource = Self::load(&env, &id)?;
         let normalised_tags = Self::validate_and_normalise_tags(&env, &tags)?;
         resource.creator.require_auth();
+        // #200: no-op when the normalised tags equal the stored tags.
+        if normalised_tags == resource.tags {
+            return Ok(());
+        }
         resource.tags = normalised_tags.clone();
         Self::save(&env, &resource);
         SetTagsEvent {
@@ -680,6 +701,19 @@ impl VaultRegistry {
     /// Retirement is the explicit removal path beyond archival: the resource
     /// is marked `retired = true` and `listed = false`, and can no longer be
     /// mutated by its creator. Retirement is irreversible.
+    ///
+    /// **Discovery-client signal (#202):** retirement emits a single
+    /// [`ResourceRetiredEvent`] (topic `"retire"`). Unlike normal delisting
+    /// (which emits [`ResourceDelistedEvent`], topic `"delist"`), retirement
+    /// does **not** emit a `delist` event. Indexers and discovery clients that
+    /// listen only for `delist` will miss retired resources; they must also
+    /// subscribe to `retire` and treat it as an authoritative "resource is
+    /// permanently removed from discovery" signal.
+    ///
+    /// **Recommended indexer logic:** on a `retire` event, mark the resource
+    /// as permanently unavailable — equivalent to, but distinct from, a
+    /// `delist`. On a `delist` event, mark the resource as temporarily
+    /// unavailable (may be re-listed by the creator).
     ///
     /// Requires the admin's authorization (see [`init`](VaultRegistry::init)).
     ///
