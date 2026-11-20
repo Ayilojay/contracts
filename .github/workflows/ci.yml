@@ -195,10 +195,29 @@ jobs:
 
       - name: Report WASM sizes
         run: |
+          # Explicit expected artifact list: every contract must produce a
+          # non-empty WASM file. A missing or empty artifact fails the step
+          # instead of silently iterating an empty glob.
+          expected_contracts=("access_lease" "subscription" "vault_registry")
+          wasm_dir="target/wasm32v1-none/release"
+
           echo "| Contract | Size (bytes) |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          for f in target/wasm32v1-none/release/*.wasm; do
+
+          missing=0
+          for contract in "${expected_contracts[@]}"; do
+            f="$wasm_dir/${contract}.wasm"
+            if [ ! -f "$f" ]; then
+              echo "::error::Expected WASM artifact not found: $f"
+              missing=1
+              continue
+            fi
             size=$(stat -c%s "$f")
+            if [ "$size" -eq 0 ]; then
+              echo "::error::Expected WASM artifact is empty: $f"
+              missing=1
+              continue
+            fi
             echo "$(basename "$f"): $size bytes"
             echo "| $(basename "$f") | $size |" >> "$GITHUB_STEP_SUMMARY"
             # Soroban rejects contracts over 64 KiB.
@@ -207,6 +226,11 @@ jobs:
               exit 1
             fi
           done
+
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::One or more expected WASM artifacts are missing or empty"
+            exit 1
+          fi
 
       - name: Upload WASM artifacts
         uses: actions/upload-artifact@v7
