@@ -55,7 +55,7 @@ callers — lives in [`SECURITY_AUDIT.md` § 2](../SECURITY_AUDIT.md#2-access-co
 | `vault-registry::accept_transfer` | Proposed new creator |
 | `vault-registry::cancel_transfer` | Stored creator |
 | `vault-registry::upgrade` / `migrate` | Admin |
-| `access-lease::grant_lease` / `extend_lease` / `revoke_lease` | Admin |
+| `access-lease::grant_lease` / `extend_lease` / `revoke_lease` / `revoke_leases` | Admin |
 | `access-lease::set_admin` / `propose_admin` / `accept_admin` / `cancel_admin_proposal` | Current admin (or pending admin for `accept_admin`) |
 | `access-lease::upgrade` / `migrate` | Admin |
 | `subscription::subscribe` / `renew` | Admin |
@@ -64,6 +64,7 @@ callers — lives in [`SECURITY_AUDIT.md` § 2](../SECURITY_AUDIT.md#2-access-co
 | `subscription::set_admin` / `upgrade` / `migrate` | Admin |
 | `*::init` | None — see [SV-12](../SECURITY_AUDIT.md#1-findings) |
 | All `get*` / `is_valid` / `is_active` / `list` reads | None (permissionless) |
+| `access-lease::lease_status` / `check_leases` / `extend_instance_ttl` | None (permissionless) |
 
 ### Version compatibility checks
 
@@ -569,6 +570,13 @@ pub struct Lease {
     pub expires_at: u32,       // exclusive
     pub duration_ledgers: u32, // as originally requested
 }
+
+/// Returned by lease_status and check_leases.
+pub enum LeaseStatus {
+    Missing,      // no record (never granted or revoked)
+    Active(u32),  // remaining_ledgers = expires_at - ledger.sequence()
+    Expired,      // record exists but expires_at <= ledger.sequence()
+}
 ```
 
 A lease is valid iff it exists and `expires_at > ledger.sequence()`.
@@ -593,8 +601,12 @@ A lease is valid iff it exists and `expires_at > ledger.sequence()`.
 | `grant_leases(requests)` | Admin | `Vec<Lease>` | `NotInitialised`, `InvalidDuration` (empty batch), `BatchTooLarge` (> `MAX_BATCH_SIZE`), `AlreadyActive`, `InvalidResourceId` |
 | `extend_lease(resource_id, buyer, extra_ledgers)` | Admin | `Lease` | `NotInitialised`, `InvalidDuration`, `LeaseNotFound` |
 | `revoke_lease(resource_id, buyer)` | Admin | `()` | `NotInitialised`, `LeaseNotFound` |
+| `revoke_leases(pairs)` | Admin | `()` | `NotInitialised`, `InvalidDuration` (empty batch), `BatchTooLarge` (> `MAX_BATCH_SIZE`); missing/duplicate entries silently skipped |
 | `is_valid(resource_id, buyer)` | — | `bool` | — |
 | `get_lease(resource_id, buyer)` | — | `Lease` (even if expired; `LeaseNotFound` if revoked) | `LeaseNotFound` |
+| `lease_status(resource_id, buyer)` | — | `LeaseStatus` — `Missing`, `Active(remaining)`, or `Expired` | — |
+| `check_leases(queries)` | — | `Vec<LeaseStatus>` — index-aligned with input | `InvalidDuration` (empty batch), `BatchTooLarge` (> `MAX_BATCH_SIZE`) |
+| `extend_instance_ttl()` | — (permissionless) | `()` — bumps instance TTL for keeper use | — |
 | `get_version()` | — | `String` | — |
 | `is_compatible()` | — | `bool` — stored version == compiled | — |
 | `upgrade(new_wasm_hash)` | Admin | `()` | `NotInitialised` |
@@ -626,6 +638,66 @@ A lease is valid iff it exists and `expires_at > ledger.sequence()`.
 - `revoke_lease` deletes the record. After a revocation there is no prior-lease
   record to inherit `granted_at` from, so a subsequent `grant_lease` on the
   same `(resource_id, buyer)` pair sets a fresh `granted_at`.
+
+- **`lease_status` (fixes #215)** returns a `LeaseStatus` enum with three
+  variants:
+
+  | Variant | Meaning | `remaining_ledgers` |
+  |---|---|---|
+  | `Missing` | No record exists (never granted or revoked) | — |
+  | `Active(remaining)` | Lease is live; `remaining = expires_at - ledger.sequence()` | > 0 |
+  | `Expired` | Record exists but `expires_at ≤ ledger.sequence()` | 0 |
+
+  `Active` and `Expired` both extend the persistent-entry TTL, matching
+  `is_valid` and `get_lease`. `lease_status` is permissionless.
+
+  *Expiry boundary:* a lease with `expires_at == ledger.sequence()` returns
+  `Expired`, not `Active` — consistent with the exclusive-boundary rule.
+
+- **`check_leases` (fixes #216)** accepts a `Vec<(resource_id, buyer)>` of up
+  to `MAX_BATCH_SIZE` (50) queries and returns a `Vec<LeaseStatus>` that is
+  index-aligned with the input. Missing entries return `Missing` rather than an
+  error. The cap keeps every call within the per-transaction ledger-entry
+  budget; callers with more than 50 pairs should paginate.
+
+- **`revoke_leases` (fixes #217)** accepts a `Vec<(resource_id, buyer)>` of up
+  to `MAX_BATCH_SIZE` (50) pairs and revokes each. Missing entries are silently
+  skipped (no error, no event). Duplicate pairs are also silently handled: the
+  first occurrence removes the record; subsequent occurrences find it absent and
+  skip. A `revoke` event is emitted for each entry that is actually removed.
+  Empty and oversized batches are rejected before any write.
+
+### Instance TTL maintenance (fixes #218)
+
+Instance storage holds the admin address and version string. Its TTL is bumped
+as a side-effect of every admin-gated write call (`grant_lease`,
+`extend_lease`, `revoke_lease`, `revoke_leases`, `set_admin`, etc.).
+
+**During read-heavy phases** — many `is_valid`, `get_lease`, `lease_status`,
+or `check_leases` calls with no writes — the instance entry is not touched, so
+its TTL drifts down. If the instance entry archives, every subsequent call,
+including reads, will fail with a host-level trap until the instance is
+restored.
+
+**Mitigation: `extend_instance_ttl()`**
+
+This permissionless entrypoint bumps the instance TTL to `PERSISTENT_TTL` (90
+days). It requires no authorisation and costs one instance-storage read and
+bump. An off-chain keeper process (cron job, monitoring bot) should call it
+periodically — typically once per day — whenever the contract is operating in a
+read-only phase.
+
+| TTL extended by | Instance TTL | Persistent lease TTL |
+|---|---|---|
+| `grant_lease` / `extend_lease` / `revoke_lease` / `revoke_leases` / admin calls | ✓ | ✓ |
+| `is_valid` / `get_lease` / `lease_status` / `check_leases` | ✗ | ✓ |
+| `extend_instance_ttl` | ✓ | ✗ |
+
+**Recommended keeper schedule:**
+
+Call `extend_instance_ttl` at least once every `PERSISTENT_TTL - PERSISTENT_TTL_THRESHOLD`
+ledgers (~1 day, see TTL constants in `lib.rs`). For safety, once per day is
+the recommended cadence. The call is idempotent and cheap.
 
 ### Storage
 

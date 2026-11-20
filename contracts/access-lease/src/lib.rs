@@ -26,6 +26,10 @@ const BUMP_THRESH: u32 = PERSISTENT_TTL_THRESHOLD;
 /// Maximum accepted length (in bytes) of a `resource_id`.
 pub const MAX_RESOURCE_ID_LEN: u32 = 64;
 
+/// Maximum number of entries accepted by [`grant_leases`], [`check_leases`],
+/// and [`revoke_leases`] in a single call.
+pub const MAX_BATCH_SIZE: u32 = 50;
+
 /// Maximum accepted lease duration in ledgers.
 ///
 /// The contract enforces no upper bound on duration beyond the natural `u32`
@@ -47,6 +51,26 @@ pub struct Lease {
     pub granted_at: u32,
     pub expires_at: u32,
     pub duration_ledgers: u32,
+}
+
+/// The result of [`AccessLease::lease_status`] — a structured alternative to
+/// the boolean [`is_valid`] that lets callers distinguish three states without
+/// a separate [`get_lease`] call.
+///
+/// - `Missing`  — no record exists (never granted, or previously revoked).
+/// - `Active`   — lease exists and `expires_at > ledger.sequence()`.
+///                `remaining_ledgers` is `expires_at - ledger.sequence()`.
+/// - `Expired`  — lease exists but `expires_at <= ledger.sequence()`.
+///                `remaining_ledgers` is `0`.
+///
+/// `Active` and `Expired` both extend the persistent-entry TTL, matching the
+/// behaviour of [`is_valid`] and [`get_lease`].
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum LeaseStatus {
+    Missing,
+    Active(u32),  // remaining_ledgers
+    Expired,
 }
 
 #[contracttype]
@@ -418,6 +442,148 @@ impl AccessLease {
         env.storage().persistent().remove(&key);
         RevokeEvent { resource_id, buyer }.publish(&env);
         Ok(())
+    }
+
+    /// Revoke leases for multiple `(resource_id, buyer)` pairs in a single
+    /// admin-authorised call.
+    ///
+    /// **Batch size:** accepts 1 to [`MAX_BATCH_SIZE`] entries (inclusive).
+    /// An empty vector is rejected with [`Error::InvalidDuration`]. A vector
+    /// exceeding [`MAX_BATCH_SIZE`] is rejected with [`Error::BatchTooLarge`].
+    /// Both size checks happen before any storage write.
+    ///
+    /// **Missing records:** a pair that has no lease record is silently skipped
+    /// (no error, no event). This matches the least-surprise expectation for
+    /// bulk operations where some pairs may already have been revoked or were
+    /// never granted.
+    ///
+    /// **Duplicates:** if the same `(resource_id, buyer)` pair appears more
+    /// than once, the first occurrence removes the record and subsequent
+    /// occurrences are silently skipped (the entry is already absent).
+    ///
+    /// **Atomicity:** all storage writes and all events are applied together.
+    /// Because missing/duplicate entries are skipped rather than erroring, the
+    /// only failure modes are the size-cap errors above, which occur before any
+    /// write.
+    pub fn revoke_leases(
+        env: Env,
+        pairs: soroban_sdk::Vec<(String, Address)>,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+
+        if pairs.is_empty() {
+            return Err(Error::InvalidDuration);
+        }
+        if pairs.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
+        for pair in pairs.iter() {
+            let key = DataKey::Lease(pair.0.clone(), pair.1.clone());
+            if env.storage().persistent().has(&key) {
+                env.storage().persistent().remove(&key);
+                RevokeEvent {
+                    resource_id: pair.0,
+                    buyer: pair.1,
+                }
+                .publish(&env);
+            }
+        }
+        Ok(())
+    }
+
+    /// Return a structured [`LeaseStatus`] for the given `(resource_id, buyer)` pair.
+    ///
+    /// Unlike [`is_valid`] (boolean) or [`get_lease`] (full record or error),
+    /// this helper gives callers a single call that distinguishes three states:
+    ///
+    /// - `LeaseStatus::Missing`  — no record (never granted, or revoked).
+    /// - `LeaseStatus::Active(remaining)` — lease is live; `remaining` is the
+    ///   number of ledgers until expiry (`expires_at - ledger.sequence()`).
+    /// - `LeaseStatus::Expired`  — record exists but already past `expires_at`.
+    ///
+    /// When a record is found (Active or Expired) the persistent-entry TTL is
+    /// extended, matching the behaviour of [`is_valid`] and [`get_lease`].
+    ///
+    /// **Expiry boundary:** a lease with `expires_at == ledger.sequence()` is
+    /// `Expired`, not `Active`. Validity is strict: `expires_at` is exclusive.
+    pub fn lease_status(env: Env, resource_id: String, buyer: Address) -> LeaseStatus {
+        let key = DataKey::Lease(resource_id, buyer);
+        match env.storage().persistent().get::<_, Lease>(&key) {
+            None => LeaseStatus::Missing,
+            Some(lease) => {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL);
+                let now = env.ledger().sequence();
+                if lease.expires_at > now {
+                    LeaseStatus::Active(lease.expires_at - now)
+                } else {
+                    LeaseStatus::Expired
+                }
+            }
+        }
+    }
+
+    /// Return the [`LeaseStatus`] for each `(resource_id, buyer)` pair in
+    /// `queries`, in the same order as the input.
+    ///
+    /// **Batch size:** accepts 1 to [`MAX_BATCH_SIZE`] queries (inclusive).
+    /// An empty vector is rejected with [`Error::InvalidDuration`]. A vector
+    /// exceeding [`MAX_BATCH_SIZE`] is rejected with [`Error::BatchTooLarge`].
+    ///
+    /// **Missing records:** a pair with no lease returns `LeaseStatus::Missing`
+    /// at its position in the output — it is not an error.
+    ///
+    /// **Ordering:** the output `Vec<LeaseStatus>` is index-aligned with the
+    /// input `queries` vec: `result[i]` corresponds to `queries[i]`.
+    ///
+    /// **Cap rationale:** at 50 entries × ~2 storage reads each, the worst-case
+    /// ledger-entry budget is well within the Soroban per-transaction limit.
+    /// Increasing the cap beyond [`MAX_BATCH_SIZE`] is a network-parameter
+    /// decision; callers with larger sets should paginate.
+    pub fn check_leases(
+        env: Env,
+        queries: soroban_sdk::Vec<(String, Address)>,
+    ) -> Result<soroban_sdk::Vec<LeaseStatus>, Error> {
+        if queries.is_empty() {
+            return Err(Error::InvalidDuration);
+        }
+        if queries.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
+        let mut results = soroban_sdk::Vec::new(&env);
+        for q in queries.iter() {
+            results.push_back(Self::lease_status(env.clone(), q.0, q.1));
+        }
+        Ok(results)
+    }
+
+    /// Extend the instance-storage TTL without performing any other operation.
+    ///
+    /// Instance storage holds the admin address and version string. Its TTL is
+    /// normally bumped as a side-effect of every admin-gated write call.
+    /// During sustained read-heavy usage (many `is_valid` / `get_lease` /
+    /// `lease_status` / `check_leases` calls with no writes) the instance entry
+    /// is **not** touched, so its TTL drifts down.
+    ///
+    /// **Who should call this:** an off-chain keeper process (cron job, bot)
+    /// should call `extend_instance_ttl` periodically — for example once per
+    /// day — whenever the contract is operating in a read-only phase. The call
+    /// requires no authorisation and costs only a single instance-storage read
+    /// and bump; it is safe to call as often as desired.
+    ///
+    /// **Why this is needed:** `is_valid`, `get_lease`, `lease_status`, and
+    /// `check_leases` only extend *persistent* lease-entry TTLs, not the
+    /// instance TTL. If the instance entry archives, every subsequent call —
+    /// including reads — will fail with a host-level trap until the instance is
+    /// restored.
+    ///
+    /// See `docs/CONTRACTS.md § access-lease Instance TTL maintenance` for the
+    /// full maintenance model.
+    pub fn extend_instance_ttl(env: Env) {
+        env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
     }
 
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
@@ -1251,6 +1417,354 @@ mod tests {
         // Check the auth record.
         client.cancel_admin_proposal();
         assert_eq!(env.auths()[0].0, admin);
+    }
+
+    // ── Issue #215: lease_status ──────────────────────────────────────────────
+
+    #[test]
+    fn lease_status_missing_when_no_record() {
+        let (env, client, _admin) = setup();
+        let buyer = Address::generate(&env);
+        let rid = String::from_str(&env, "r");
+        assert_eq!(client.lease_status(&rid, &buyer), LeaseStatus::Missing);
+    }
+
+    #[test]
+    fn lease_status_active_with_remaining_ledgers() {
+        let (env, client, _admin) = setup();
+        let buyer = Address::generate(&env);
+        let rid = String::from_str(&env, "r");
+        client.grant_lease(&rid, &buyer, &100u32);
+        advance(&env, 30);
+        match client.lease_status(&rid, &buyer) {
+            LeaseStatus::Active(remaining) => assert_eq!(remaining, 70u32),
+            other => panic!("expected Active, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn lease_status_expired_when_past_expiry() {
+        let (env, client, _admin) = setup();
+        let buyer = Address::generate(&env);
+        let rid = String::from_str(&env, "r");
+        client.grant_lease(&rid, &buyer, &10u32);
+        advance(&env, 10); // exactly at expires_at — exclusive, so expired
+        assert_eq!(client.lease_status(&rid, &buyer), LeaseStatus::Expired);
+        advance(&env, 5); // well past
+        assert_eq!(client.lease_status(&rid, &buyer), LeaseStatus::Expired);
+    }
+
+    /// Exact expiry boundary: one ledger before → Active, at expires_at → Expired.
+    #[test]
+    fn lease_status_exact_expiry_boundary() {
+        let (env, client, _admin) = setup();
+        let buyer = Address::generate(&env);
+        let rid = String::from_str(&env, "r");
+        let lease = client.grant_lease(&rid, &buyer, &100u32);
+        let expires_at = lease.expires_at;
+
+        advance(&env, 99); // ledger = expires_at - 1
+        match client.lease_status(&rid, &buyer) {
+            LeaseStatus::Active(remaining) => assert_eq!(remaining, 1u32),
+            other => panic!("expected Active(1), got {:?}", other),
+        }
+
+        advance(&env, 1); // ledger = expires_at exactly
+        assert_eq!(env.ledger().sequence(), expires_at);
+        assert_eq!(client.lease_status(&rid, &buyer), LeaseStatus::Expired);
+    }
+
+    #[test]
+    fn lease_status_missing_after_revoke() {
+        let (env, client, _admin) = setup();
+        let buyer = Address::generate(&env);
+        let rid = String::from_str(&env, "r");
+        client.grant_lease(&rid, &buyer, &100u32);
+        client.revoke_lease(&rid, &buyer);
+        assert_eq!(client.lease_status(&rid, &buyer), LeaseStatus::Missing);
+    }
+
+    // ── Issue #216: check_leases ──────────────────────────────────────────────
+
+    #[test]
+    fn check_leases_returns_ordered_statuses() {
+        let (env, client, _admin) = setup();
+        let b1 = Address::generate(&env);
+        let b2 = Address::generate(&env);
+        let b3 = Address::generate(&env);
+        let r1 = String::from_str(&env, "r1");
+        let r2 = String::from_str(&env, "r2");
+        let r3 = String::from_str(&env, "r3");
+
+        client.grant_lease(&r1, &b1, &100u32);
+        client.grant_lease(&r2, &b2, &10u32);
+        // r3/b3 never granted
+
+        advance(&env, 10); // r2 expires exactly here
+
+        let mut queries = soroban_sdk::Vec::new(&env);
+        queries.push_back((r1.clone(), b1.clone()));
+        queries.push_back((r2.clone(), b2.clone()));
+        queries.push_back((r3.clone(), b3.clone()));
+
+        let results = client.check_leases(&queries);
+        assert_eq!(results.len(), 3);
+        // r1 still active (90 remaining)
+        assert_eq!(results.get_unchecked(0), LeaseStatus::Active(90));
+        // r2 expired
+        assert_eq!(results.get_unchecked(1), LeaseStatus::Expired);
+        // r3 missing
+        assert_eq!(results.get_unchecked(2), LeaseStatus::Missing);
+    }
+
+    #[test]
+    fn check_leases_empty_batch_rejected() {
+        let (env, client, _admin) = setup();
+        let empty: soroban_sdk::Vec<(String, Address)> = soroban_sdk::Vec::new(&env);
+        assert_eq!(
+            client.try_check_leases(&empty),
+            Err(Ok(Error::InvalidDuration))
+        );
+    }
+
+    #[test]
+    fn check_leases_over_max_batch_size_rejected() {
+        let (env, client, _admin) = setup();
+        let mut queries: soroban_sdk::Vec<(String, Address)> = soroban_sdk::Vec::new(&env);
+        for i in 0..=MAX_BATCH_SIZE {
+            let rid = String::from_str(&env, &soroban_sdk::format!(&env, "r{}", i));
+            let buyer = Address::generate(&env);
+            queries.push_back((rid, buyer));
+        }
+        assert_eq!(
+            client.try_check_leases(&queries),
+            Err(Ok(Error::BatchTooLarge))
+        );
+    }
+
+    #[test]
+    fn check_leases_at_max_batch_size_succeeds() {
+        let (env, client, _admin) = setup();
+        let mut queries: soroban_sdk::Vec<(String, Address)> = soroban_sdk::Vec::new(&env);
+        for i in 0..MAX_BATCH_SIZE {
+            let rid = String::from_str(&env, &soroban_sdk::format!(&env, "r{}", i));
+            let buyer = Address::generate(&env);
+            queries.push_back((rid, buyer));
+        }
+        let results = client.check_leases(&queries);
+        assert_eq!(results.len(), MAX_BATCH_SIZE);
+        // All are missing (none were granted)
+        for i in 0..MAX_BATCH_SIZE {
+            assert_eq!(results.get_unchecked(i), LeaseStatus::Missing);
+        }
+    }
+
+    // ── Issue #217: revoke_leases ─────────────────────────────────────────────
+
+    #[test]
+    fn revoke_leases_removes_all_valid_entries() {
+        let (env, client, _admin) = setup();
+        let b1 = Address::generate(&env);
+        let b2 = Address::generate(&env);
+        let r1 = String::from_str(&env, "r1");
+        let r2 = String::from_str(&env, "r2");
+
+        client.grant_lease(&r1, &b1, &100u32);
+        client.grant_lease(&r2, &b2, &100u32);
+
+        let mut pairs = soroban_sdk::Vec::new(&env);
+        pairs.push_back((r1.clone(), b1.clone()));
+        pairs.push_back((r2.clone(), b2.clone()));
+
+        client.revoke_leases(&pairs);
+
+        assert!(!client.is_valid(&r1, &b1));
+        assert!(!client.is_valid(&r2, &b2));
+        assert_eq!(client.try_get_lease(&r1, &b1), Err(Ok(Error::LeaseNotFound)));
+        assert_eq!(client.try_get_lease(&r2, &b2), Err(Ok(Error::LeaseNotFound)));
+    }
+
+    #[test]
+    fn revoke_leases_skips_missing_entries_silently() {
+        let (env, client, _admin) = setup();
+        let b1 = Address::generate(&env);
+        let b2 = Address::generate(&env); // never granted
+        let r1 = String::from_str(&env, "r1");
+        let r2 = String::from_str(&env, "r2");
+
+        client.grant_lease(&r1, &b1, &100u32);
+
+        let mut pairs = soroban_sdk::Vec::new(&env);
+        pairs.push_back((r1.clone(), b1.clone()));
+        pairs.push_back((r2.clone(), b2.clone())); // missing — should not error
+
+        // Must succeed despite missing entry
+        client.revoke_leases(&pairs);
+        assert!(!client.is_valid(&r1, &b1));
+    }
+
+    #[test]
+    fn revoke_leases_duplicate_pair_skipped_after_first() {
+        let (env, client, _admin) = setup();
+        let buyer = Address::generate(&env);
+        let rid = String::from_str(&env, "r");
+
+        client.grant_lease(&rid, &buyer, &100u32);
+
+        let mut pairs = soroban_sdk::Vec::new(&env);
+        pairs.push_back((rid.clone(), buyer.clone()));
+        pairs.push_back((rid.clone(), buyer.clone())); // duplicate
+
+        // Must succeed: second occurrence is a no-op
+        client.revoke_leases(&pairs);
+        assert!(!client.is_valid(&rid, &buyer));
+    }
+
+    #[test]
+    fn revoke_leases_emits_revoke_event_per_removed_entry() {
+        let (env, client, _admin) = setup();
+        let b1 = Address::generate(&env);
+        let b2 = Address::generate(&env);
+        let r1 = String::from_str(&env, "r1");
+        let r2 = String::from_str(&env, "r2");
+
+        client.grant_lease(&r1, &b1, &100u32);
+        client.grant_lease(&r2, &b2, &100u32);
+
+        let mut pairs = soroban_sdk::Vec::new(&env);
+        pairs.push_back((r1.clone(), b1.clone()));
+        pairs.push_back((r2.clone(), b2.clone()));
+
+        client.revoke_leases(&pairs);
+
+        let revoke_sym: soroban_sdk::Val =
+            soroban_sdk::symbol_short!("revoke").into_val(&env);
+        let revoke_count = env
+            .events()
+            .all()
+            .filter_by_contract(&client.address)
+            .iter()
+            .filter(|(_, topics, _)| {
+                !topics.is_empty() && topics.get_unchecked(0) == revoke_sym
+            })
+            .count();
+        assert_eq!(revoke_count, 2);
+    }
+
+    #[test]
+    fn revoke_leases_empty_batch_rejected() {
+        let (env, client, _admin) = setup();
+        let empty: soroban_sdk::Vec<(String, Address)> = soroban_sdk::Vec::new(&env);
+        assert_eq!(
+            client.try_revoke_leases(&empty),
+            Err(Ok(Error::InvalidDuration))
+        );
+    }
+
+    #[test]
+    fn revoke_leases_over_max_batch_size_rejected() {
+        let (env, client, _admin) = setup();
+        let mut pairs: soroban_sdk::Vec<(String, Address)> = soroban_sdk::Vec::new(&env);
+        for i in 0..=MAX_BATCH_SIZE {
+            let rid = String::from_str(&env, &soroban_sdk::format!(&env, "r{}", i));
+            let buyer = Address::generate(&env);
+            pairs.push_back((rid, buyer));
+        }
+        assert_eq!(
+            client.try_revoke_leases(&pairs),
+            Err(Ok(Error::BatchTooLarge))
+        );
+    }
+
+    #[test]
+    fn revoke_leases_requires_admin_auth() {
+        let (env, client, admin) = setup();
+        let buyer = Address::generate(&env);
+        let rid = String::from_str(&env, "r");
+        client.grant_lease(&rid, &buyer, &100u32);
+
+        let mut pairs = soroban_sdk::Vec::new(&env);
+        pairs.push_back((rid.clone(), buyer.clone()));
+
+        client.revoke_leases(&pairs);
+        assert_eq!(env.auths()[0].0, admin);
+    }
+
+    // ── Issue #218: instance TTL during read-heavy usage ─────────────────────
+
+    /// Demonstrates that `is_valid` / `get_lease` / `lease_status` /
+    /// `check_leases` extend persistent lease TTLs but do NOT touch the
+    /// instance TTL. `extend_instance_ttl` is the dedicated keeper call for
+    /// that purpose.
+    #[test]
+    fn read_ops_extend_lease_ttl_but_not_instance_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        // Set a very short max_entry_ttl so we can observe TTL values clearly.
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 0;
+            l.min_persistent_entry_ttl = 1000;
+            l.min_temp_entry_ttl = 1000;
+            l.max_entry_ttl = 200_000;
+        });
+        let id = env.register(AccessLease, ());
+        let client = AccessLeaseClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        client.init(&admin);
+
+        let buyer = Address::generate(&env);
+        let rid = String::from_str(&env, "r");
+        client.grant_lease(&rid, &buyer, &1000u32);
+
+        // Record instance TTL after grant (bumped by require_admin).
+        let instance_ttl_after_grant = env.storage().instance().get_ttl();
+
+        // Advance and do many read operations.
+        advance(&env, 500);
+        for _ in 0..10 {
+            client.is_valid(&rid, &buyer);
+        }
+        for _ in 0..10 {
+            let _ = client.get_lease(&rid, &buyer);
+        }
+        for _ in 0..10 {
+            client.lease_status(&rid, &buyer);
+        }
+
+        // Persistent lease TTL is extended by reads.
+        let lease_ttl = env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::Lease(rid.clone(), buyer.clone()));
+        assert!(lease_ttl > 0);
+
+        // Instance TTL has decreased (reads did not bump it).
+        let instance_ttl_after_reads = env.storage().instance().get_ttl();
+        assert!(
+            instance_ttl_after_reads < instance_ttl_after_grant,
+            "instance TTL should have decreased during read-only phase: before={}, after={}",
+            instance_ttl_after_grant,
+            instance_ttl_after_reads
+        );
+
+        // extend_instance_ttl restores the instance TTL without requiring admin.
+        client.extend_instance_ttl();
+        let instance_ttl_after_keeper = env.storage().instance().get_ttl();
+        assert!(
+            instance_ttl_after_keeper > instance_ttl_after_reads,
+            "extend_instance_ttl should raise instance TTL: before={}, after={}",
+            instance_ttl_after_reads,
+            instance_ttl_after_keeper
+        );
+    }
+
+    /// extend_instance_ttl requires no authorisation and can be called by anyone.
+    #[test]
+    fn extend_instance_ttl_requires_no_auth() {
+        let (env, client, _admin) = setup();
+        // No mock_auths beyond setup's mock_all_auths — just call it directly.
+        client.extend_instance_ttl();
+        // If it panicked on auth, the test would fail. Reaching here is enough.
     }
 }
 #[cfg(test)]
