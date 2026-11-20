@@ -73,9 +73,33 @@ jobs:
 
       - name: Configure network
         run: |
-          stellar network add "$NETWORK" \
-            --rpc-url "$RPC_URL" \
-            --network-passphrase "$NETWORK_PASSPHRASE" 2>/dev/null || true
+          set -euo pipefail
+          if stellar network add "$NETWORK" \
+              --rpc-url "$RPC_URL" \
+              --network-passphrase "$NETWORK_PASSPHRASE" 2>/dev/null; then
+            echo "Network '$NETWORK' configured."
+          elif stellar network ls 2>/dev/null | grep -qx "$NETWORK"; then
+            echo "Network '$NETWORK' already configured; verifying settings."
+            CONFIG=$(stellar network settings "$NETWORK" 2>/dev/null || true)
+            if [ -z "$CONFIG" ]; then
+              echo "::error::Unable to read settings for existing network '$NETWORK'."
+              exit 1
+            fi
+            ACTUAL_RPC=$(printf '%s\n' "$CONFIG" | grep -i 'rpc' | head -n1 | sed -E 's/.*: *//' | tr -d '"')
+            ACTUAL_PASS=$(printf '%s\n' "$CONFIG" | grep -i 'passphrase' | head -n1 | sed -E 's/.*: *//' | tr -d '"')
+            if [ "$ACTUAL_RPC" != "$RPC_URL" ]; then
+              echo "::error::Network '$NETWORK' RPC URL mismatch: expected '$RPC_URL', got '$ACTUAL_RPC'."
+              exit 1
+            fi
+            if [ "$ACTUAL_PASS" != "$NETWORK_PASSPHRASE" ]; then
+              echo "::error::Network '$NETWORK' passphrase mismatch: expected '$NETWORK_PASSPHRASE', got '$ACTUAL_PASS'."
+              exit 1
+            fi
+            echo "Existing network '$NETWORK' settings verified."
+          else
+            echo "::error::Failed to configure network '$NETWORK'."
+            exit 1
+          fi
 
       - name: Deploy + init contracts
         run: |

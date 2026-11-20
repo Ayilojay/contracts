@@ -61,10 +61,47 @@ jobs:
           stellar --version
 
       - name: Configure testnet
+        env:
+          EXPECTED_RPC_URL: https://soroban-testnet.stellar.org
+          EXPECTED_PASSPHRASE: "Test SDF Network ; September 2015"
         run: |
-          stellar network add testnet \
-            --rpc-url https://soroban-testnet.stellar.org \
-            --network-passphrase "Test SDF Network ; September 2015" 2>/dev/null || true
+          set -euo pipefail
+
+          # Attempt to add the network. Capture stderr so we can distinguish the
+          # already-configured case from genuine configuration failures.
+          if ADD_ERR=$(stellar network add testnet \
+                --rpc-url "$EXPECTED_RPC_URL" \
+                --network-passphrase "$EXPECTED_PASSPHRASE" 2>&1); then
+            echo "Configured testnet network."
+            exit 0
+          fi
+
+          if ! grep -qi 'already' <<< "$ADD_ERR"; then
+            echo "::error::Failed to configure testnet network: $ADD_ERR"
+            exit 1
+          fi
+
+          # Already configured: verify the existing settings match expectations.
+          echo "testnet already configured; verifying RPC URL and passphrase."
+          NETWORK_JSON=$(stellar network ls --long 2>/dev/null || true)
+          if [ -z "$NETWORK_JSON" ]; then
+            echo "::error::Could not read existing network configuration to verify testnet settings."
+            exit 1
+          fi
+
+          if ! grep -qF "$EXPECTED_RPC_URL" <<< "$NETWORK_JSON"; then
+            echo "::error::Existing testnet RPC URL does not match expected $EXPECTED_RPC_URL"
+            echo "$NETWORK_JSON"
+            exit 1
+          fi
+
+          if ! grep -qF "$EXPECTED_PASSPHRASE" <<< "$NETWORK_JSON"; then
+            echo "::error::Existing testnet passphrase does not match expected '$EXPECTED_PASSPHRASE'"
+            echo "$NETWORK_JSON"
+            exit 1
+          fi
+
+          echo "Existing testnet configuration verified."
 
       - name: Fund accounts
         run: |
