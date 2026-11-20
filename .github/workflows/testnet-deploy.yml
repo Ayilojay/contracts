@@ -37,14 +37,36 @@ jobs:
     steps:
       - id: check
         env:
-          DEPLOYER_SECRET: ${{ secrets.DEPLOYER_SECRET }}
+          DEPLOYER_SECRET:   ${{ secrets.DEPLOYER_SECRET }}
+          BACKEND_PUBLIC:    ${{ secrets.BACKEND_PUBLIC }}
+          PUBLISHER1_PUBLIC: ${{ secrets.PUBLISHER1_PUBLIC }}
+          PUBLISHER2_PUBLIC: ${{ secrets.PUBLISHER2_PUBLIC }}
         run: |
-          if [ -n "$DEPLOYER_SECRET" ]; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          else
+          # Required: needed by later deploy/init steps.
+          # Optional: funding-only accounts; absence is tolerated.
+          REQUIRED="DEPLOYER_SECRET BACKEND_PUBLIC PUBLISHER1_PUBLIC PUBLISHER2_PUBLIC"
+          OPTIONAL="BACKEND_SECRET"
+
+          missing=""
+          for VAR in $REQUIRED; do
+            if [ -z "${!VAR}" ]; then
+              missing="$missing $VAR"
+            fi
+          done
+
+          if [ -n "$missing" ]; then
             echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::DEPLOYER_SECRET is not set — skipping testnet deploy. Add the deploy secrets in repo Settings → Secrets → Actions."
+            echo "::error::Missing required deploy configuration:$missing — set these in repo Settings → Secrets → Actions. Skipping testnet deploy."
+            exit 0
           fi
+
+          for VAR in $OPTIONAL; do
+            if [ -z "${!VAR}" ]; then
+              echo "::notice::Optional variable $VAR is not set — funding for that account will be skipped."
+            fi
+          done
+
+          echo "ready=true" >> "$GITHUB_OUTPUT"
 
   deploy:
     name: Build + Deploy + Init on Stellar Testnet
@@ -88,7 +110,12 @@ jobs:
           stellar keys add deployer --secret-key <<< "$DEPLOYER_SECRET" >/dev/null 2>&1 || true
           DEPLOYER_PUB=$(stellar keys address deployer 2>/dev/null \
             || echo "GCJH6RF7EU7LRXZK3QPJD2XZ7ZL7GI67WUPVRWROJ6XDEJKHIKW7GFWX")
+          # Required accounts (validated in check-secrets) plus optional funding-only accounts.
           for ADDR in "$DEPLOYER_PUB" "$BACKEND_PUBLIC" "$PUBLISHER1_PUBLIC" "$PUBLISHER2_PUBLIC"; do
+            if [ -z "$ADDR" ]; then
+              echo "Skipping funding for unset optional account"
+              continue
+            fi
             echo "Funding $ADDR"
             curl -sf "https://friendbot.stellar.org?addr=${ADDR}" > /dev/null && echo "  ✅" || echo "  ⚠️"
           done
