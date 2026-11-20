@@ -56,7 +56,7 @@ callers — lives in [`SECURITY_AUDIT.md` § 2](../SECURITY_AUDIT.md#2-access-co
 | `vault-registry::cancel_transfer` | Stored creator |
 | `vault-registry::upgrade` / `migrate` | Admin |
 | `access-lease::grant_lease` / `extend_lease` / `revoke_lease` | Admin |
-| `access-lease::set_admin` / `propose_admin` / `accept_admin` | Current admin (or pending admin for `accept_admin`) |
+| `access-lease::set_admin` / `propose_admin` / `accept_admin` / `cancel_admin_proposal` | Current admin (or pending admin for `accept_admin`) |
 | `access-lease::upgrade` / `migrate` | Admin |
 | `subscription::subscribe` / `renew` | Admin |
 | `subscription::create_plan` / `deactivate_plan` / `transfer_plan` | Publisher |
@@ -125,6 +125,13 @@ The same concept can have a different code in each contract. Shared concepts:
 | `NotFound` | 2 | — (uses `LeaseNotFound`) | 2 (`PlanNotFound`) |
 | `InvalidPrice` | 3 | — | 7 |
 | `InvalidResourceId` / `InvalidPlanId` | 10 (`InvalidResourceId`) | 9 (`InvalidResourceId`) | 12 (`InvalidPlanId`) |
+
+New codes added in this release:
+
+| Concept | access-lease |
+|---|---|
+| `BatchTooLarge` | 12 |
+| `NoPendingProposal` | 13 |
 
 Notes:
 
@@ -450,6 +457,11 @@ pub struct Lease {
 
 A lease is valid iff it exists and `expires_at > ledger.sequence()`.
 
+| Constant | Value |
+|---|---|
+| `MAX_RESOURCE_ID_LEN` | 64 bytes |
+| `MAX_BATCH_SIZE` | 50 |
+
 ### Functions
 
 | Function | Auth | Returns | Errors |
@@ -457,8 +469,12 @@ A lease is valid iff it exists and `expires_at > ledger.sequence()`.
 | `init(admin)` | — (one-time) | `()` | `AlreadyInitialised` |
 | `admin()` | — | `Address` | `NotInitialised` |
 | `set_admin(new_admin)` | Admin | `()` | `NotInitialised` |
+| `propose_admin(pending_admin)` | Admin | `()` | `NotInitialised` |
+| `accept_admin(pending_admin)` | Pending admin | `()` | `NotInitialised`, `NoPendingAdmin`, `NotPendingAdmin` |
+| `cancel_admin_proposal()` | Admin | `()` | `NotInitialised`, `NoPendingProposal` |
+| `pending_admin()` | — | `Option<Address>` | — |
 | `grant_lease(resource_id, buyer, duration_ledgers)` | Admin | `Lease` | `NotInitialised`, `InvalidDuration`, `AlreadyActive`, `InvalidResourceId` |
-| `grant_leases(requests)` | Admin | `Vec<Lease>` | `NotInitialised`, `InvalidDuration`, `AlreadyActive`, `InvalidResourceId` |
+| `grant_leases(requests)` | Admin | `Vec<Lease>` | `NotInitialised`, `InvalidDuration` (empty batch), `BatchTooLarge` (> `MAX_BATCH_SIZE`), `AlreadyActive`, `InvalidResourceId` |
 | `extend_lease(resource_id, buyer, extra_ledgers)` | Admin | `Lease` | `NotInitialised`, `InvalidDuration`, `LeaseNotFound` |
 | `revoke_lease(resource_id, buyer)` | Admin | `()` | `NotInitialised`, `LeaseNotFound` |
 | `is_valid(resource_id, buyer)` | — | `bool` | — |
@@ -477,6 +493,13 @@ A lease is valid iff it exists and `expires_at > ledger.sequence()`.
 - `extend_lease` computes `max(expires_at, now) + extra_ledgers`, so an expired
   lease restarts from the current ledger. Zero / overflowing extensions are rejected.
 - `revoke_lease` deletes the record.
+- `grant_leases` accepts between 1 and `MAX_BATCH_SIZE` (50) requests inclusive.
+  An empty vector is rejected with `InvalidDuration`. A vector exceeding `MAX_BATCH_SIZE`
+  is rejected with `BatchTooLarge`. Both checks happen before any storage write, making
+  the entire call atomic: either all leases are granted or none are.
+- `cancel_admin_proposal` allows the current admin to cancel an outstanding `propose_admin`
+  proposal. Reverts with `NoPendingProposal` if no proposal is pending. After cancellation
+  the pending slot is cleared and any subsequent `accept_admin` call fails with `NoPendingAdmin`.
 
 ### Storage
 
@@ -494,6 +517,7 @@ A lease is valid iff it exists and `expires_at > ledger.sequence()`.
 | `("setadmin",)` | new admin |
 | `("proposeadmin",)` | pending admin |
 | `("acceptadmin",)` | new admin |
+| `("canceladmin",)` | cancelled pending admin address |
 | `("grant", resource_id, buyer)` | `expires_at` |
 | `("extend", resource_id, buyer)` | new `expires_at` |
 | `("revoke", resource_id, buyer)` | `()` |
@@ -510,13 +534,15 @@ for how they compare with the other contracts.
 | 1 | `NotAdmin` | Reserved. Never returned: admin-gated entrypoints call `admin.require_auth()`, so a failed authorisation traps (panics) instead of returning this code. |
 | 2 | `LeaseNotFound` | No lease for the pair. |
 | 3 | `AlreadyActive` | A non-expired lease already exists for the pair. |
-| 4 | `InvalidDuration` | Duration is zero or the resulting expiry overflows `u32`. |
+| 4 | `InvalidDuration` | Duration is zero or the resulting expiry overflows `u32`. Also returned when `grant_leases` receives an empty batch. |
 | 5 | `NotInitialised` | Admin-only call before `init`. |
 | 7 | `AlreadyInitialised` | `init` called twice. |
 | 8 | `LeaseExpired` | The lease has already expired; there is nothing to revoke. |
 | 9 | `InvalidResourceId` | Resource id is empty or > 64 bytes. |
 | 10 | `NoPendingAdmin` | Admin acceptance called with no pending proposal. |
 | 11 | `NotPendingAdmin` | Address is not the proposed admin. |
+| 12 | `BatchTooLarge` | `grant_leases` received more than `MAX_BATCH_SIZE` (50) requests. |
+| 13 | `NoPendingProposal` | `cancel_admin_proposal` called with no pending proposal. |
 
 ---
 
