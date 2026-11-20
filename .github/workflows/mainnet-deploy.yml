@@ -13,6 +13,7 @@ permissions:
 
 env:
   STELLAR_CLI_VERSION: "27.0.0"
+  STELLAR_CLI_SHA256: "0000000000000000000000000000000000000000000000000000000000000000"
 
 jobs:
   confirm:
@@ -61,9 +62,13 @@ jobs:
 
       - name: Install Stellar CLI v${{ env.STELLAR_CLI_VERSION }}
         run: |
-          curl -sL \
-            "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
-            | sudo tar xz -C /usr/local/bin
+          set -euo pipefail
+          ARCHIVE="stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          URL="https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/${ARCHIVE}"
+          curl -fsSL -o "$ARCHIVE" "$URL"
+          echo "${STELLAR_CLI_SHA256}  ${ARCHIVE}" | sha256sum -c -
+          sudo tar xzf "$ARCHIVE" -C /usr/local/bin
+          rm -f "$ARCHIVE"
           stellar --version
 
       - name: Test contracts
