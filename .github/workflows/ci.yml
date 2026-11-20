@@ -19,6 +19,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   STELLAR_CLI_VERSION: "27.0.0"
+  # Keep in sync with `rust-version` in Cargo.toml.
+  MSRV: "1.91"
 
 jobs:
   check-events:
@@ -55,6 +57,33 @@ jobs:
 
       - name: Audit workspace lockfile
         run: cargo audit --file Cargo.lock
+
+  msrv:
+    name: MSRV check (${{ env.MSRV }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust ${{ env.MSRV }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+          targets: wasm32v1-none
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify declared rust-version matches MSRV
+        run: |
+          declared=$(grep -E '^rust-version' Cargo.toml | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "Cargo.toml rust-version: $declared"
+          echo "CI MSRV: $MSRV"
+          if [ "$declared" != "$MSRV" ]; then
+            echo "::error::Cargo.toml rust-version ($declared) does not match CI MSRV ($MSRV)"
+            exit 1
+          fi
+
+      - name: Locked dependency check on MSRV
+        run: cargo check --workspace --all-targets --locked
 
   lint:
     name: Format + Clippy + Docs
