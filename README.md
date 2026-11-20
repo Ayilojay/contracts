@@ -279,3 +279,6 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-232 -->
 - #232: [subscription] Expose the billing cycle length through the contract interface
+
+<!-- handsoff-issue-187 -->
+- #187: [vault-registry] Normalize tag filters using the storage normalization rule
