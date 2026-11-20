@@ -288,3 +288,6 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-193 -->
 - #193: [vault-registry] Offer bounded multi-resource reads
+
+<!-- handsoff-issue-194 -->
+- #194: [vault-registry] Add creator-filtered resource discovery
