@@ -285,3 +285,6 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-188 -->
 - #188: [vault-registry] Add a pending ownership proposal getter
+
+<!-- handsoff-issue-189 -->
+- #189: [vault-registry] Add explicit expiry to ownership transfer proposals
