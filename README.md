@@ -288,3 +288,6 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-189 -->
 - #189: [vault-registry] Add explicit expiry to ownership transfer proposals
+
+<!-- handsoff-issue-190 -->
+- #190: [vault-registry] Define a discovery-index retention policy
