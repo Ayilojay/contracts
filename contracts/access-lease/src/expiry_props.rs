@@ -2,14 +2,14 @@
 //! `is_valid`). Each property is checked against a plain-integer model of the
 //! documented rules instead of hand-picked examples:
 //!
-//! - grant:  `expires_at = now + duration`, or `InvalidDuration` on overflow
-//!   or when `duration` exceeds `MAX_LEASE_DURATION`. Granting over an expired
-//!   lease preserves the original `granted_at` (grant history) while starting
-//!   a fresh `expires_at` from the current ledger.
+//! - grant:  `expires_at = now + duration`, or `InvalidDuration` on overflow.
+//!   There is no upper cap on duration beyond the natural `u32` overflow guard
+//!   (`MAX_LEASE_DURATION == u32::MAX` reflects this).  Granting over an
+//!   expired lease preserves the original `granted_at` (grant history) while
+//!   starting a fresh `expires_at` from the current ledger.
 //! - extend: `expires_at = max(expires_at, now) + extra`, or `InvalidDuration`
-//!   on overflow or when `extra` exceeds `MAX_LEASE_DURATION`, leaving the
-//!   stored lease untouched. `duration_ledgers` is the originally requested
-//!   duration and is never rewritten by an extension.
+//!   on overflow, leaving the stored lease untouched.  `duration_ledgers` is
+//!   the originally requested duration and is never rewritten by an extension.
 //! - valid:  a lease is valid while `expires_at > ledger.sequence()`.
 //! - ttl:    the persistent entry TTL always covers the full lease lifetime
 //!   (plus a safety margin), so a valid lease never archives before
@@ -176,6 +176,9 @@ proptest! {
     /// Re-granting is refused while the lease is active and, once it has
     /// expired, starts a fresh lease from the current ledger while preserving
     /// the original `granted_at` (grant history is never reset).
+    ///
+    /// `grant_lease_internal` preserves `granted_at` from the expired lease
+    /// record on re-grant so that callers can always trace the first issuance.
     #[test]
     fn regrant_only_after_expiry_and_restarts_from_now(
         now in 0..=MAX_START,

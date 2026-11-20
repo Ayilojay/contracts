@@ -268,6 +268,105 @@ are accepted on input and normalised to lowercase before storage, so the
 effective stored alphabet is `[a-z0-9!"#$%&'()*+,\-./:;<=>?@[\\\]^_{|}~]`.
 Any tag byte outside this range causes `InvalidTag`.
 
+### Metadata pointer validation (fixes #203)
+
+The `metadata` field on a `Resource` is an opaque byte string of 1–512 bytes.
+The contract enforces only two on-chain rules:
+
+1. **Non-empty** — an empty string is rejected with `MetadataEmpty`.
+2. **Length ≤ 512 bytes** — a string longer than `MAX_METADATA_POINTER_LEN`
+   is rejected with `MetadataTooLong`.
+
+URI syntax, content-hash format, and reachability are **not** validated
+on-chain. The backend is responsible for supplying well-formed pointers before
+calling `register` or `update_metadata`.
+
+**Supported pointer formats (examples):**
+
+| Format | Example value |
+|---|---|
+| IPFS CIDv1 (base32) | `bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi` |
+| IPFS CIDv0 (base58) | `QmcDX14at6pX9BYRnB1rfm7oBRhGBPLqUoAyfeahXWFGeJ` |
+| IPFS URI | `ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi` |
+| IPFS gateway URL | `https://ipfs.io/ipfs/QmcDX14at6pX9BYRnB1rfm7oBRhGBPLqUoAyfeahXWFGeJ` |
+| SHA-256 hex digest | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
+| Compact JSON anchor | `{"cid":"bafybe…","sha256":"e3b0c4…"}` |
+
+**What is validated off-chain (backend responsibility):**
+
+- URI scheme and syntax (e.g. `ipfs://` or `https://`).
+- Content-hash format and length (e.g. CIDv1 must be a valid multibase string).
+- Reachability — the pointer must resolve before it is registered.
+- Maximum length of 512 bytes is also a good client-side guard before submitting
+  the transaction.
+
+**Invalid frontend inputs that will be rejected on-chain:**
+
+| Input | Error |
+|---|---|
+| `""` (empty string) | `MetadataEmpty` |
+| A string of 513 or more bytes | `MetadataTooLong` |
+
+**Invalid frontend inputs that pass on-chain but should be caught off-chain:**
+
+| Input | Why it passes on-chain | Recommended off-chain check |
+|---|---|---|
+| `"not-a-uri"` | Arbitrary byte strings are accepted | Validate URI scheme |
+| `"ipfs://BAFYBE…"` (uppercase CID) | Byte length is fine | Normalise to lowercase CID |
+| `"https://example.com/"` (no content hash) | Byte length is fine | Require a content-addressable pointer |
+
+### Identifier namespace and normalisation (fixes #204)
+
+Resource IDs are opaque byte strings of 1–64 bytes. The contract enforces only
+two rules on-chain:
+
+1. **Non-empty** — an empty ID is rejected with `InvalidResourceId`.
+2. **Length ≤ 64 bytes** — an ID longer than `MAX_RESOURCE_ID_LEN` is rejected
+   with `InvalidResourceId`.
+
+**There is no case-folding, whitespace trimming, or publisher-namespace prefix
+applied by the contract.** IDs are stored and keyed exactly as supplied by the
+caller.
+
+**Canonical identifier rules (backend and client policy):**
+
+The backend enforces the following conventions before submitting an ID
+on-chain. Clients, SDKs, and indexers must apply the same rules when
+constructing or comparing IDs:
+
+1. **Lowercase only.** Use only lowercase ASCII letters (`a-z`), digits
+   (`0-9`), hyphens (`-`), underscores (`_`), and forward slashes (`/`).
+   Mixed-case IDs are accepted by the contract but will not collide with their
+   lowercase equivalents — `"MyVault"` and `"myvault"` are distinct keys.
+2. **No leading, trailing, or consecutive whitespace.** The contract does not
+   strip whitespace; `"my vault"` and `"myvault"` are different IDs.
+3. **Publisher namespace prefix.** IDs are namespaced by publisher using a
+   `/`-separated prefix: `<publisher-slug>/<resource-slug>` (e.g.
+   `acme-corp/quarterly-report-2024`). This convention is enforced by the
+   backend, not the contract, but indexers and clients must respect it when
+   displaying or searching resources.
+4. **Immutability.** An ID is set at registration and can never be changed.
+   The only way to change an ID is to retire the old resource and register a
+   new one.
+
+**Collision behaviour:**
+
+Because the contract performs no normalisation, two IDs that differ only in
+case or whitespace are stored as separate entries (`AlreadyRegistered` checks
+byte-exact equality). The backend prevents such collisions by normalising
+before calling `register`.
+
+**Round-trip examples:**
+
+| Backend input | On-chain key | Notes |
+|---|---|---|
+| `"acme-corp/report-2024"` | `"acme-corp/report-2024"` | Canonical form; passes as-is |
+| `"Acme-Corp/Report-2024"` | `"Acme-Corp/Report-2024"` | Backend normalises to lowercase before `register` |
+| `"acme-corp/report-2024"` (second call) | — | `AlreadyRegistered` |
+| `" acme-corp/report-2024"` (leading space) | — | Backend rejects before submitting; on-chain would create a distinct key |
+| `""` (empty) | — | `InvalidResourceId` |
+| 65-byte string | — | `InvalidResourceId` |
+
 ### Functions
 
 | Function | Auth | Returns | Errors |
@@ -472,11 +571,28 @@ A lease is valid iff it exists and `expires_at > ledger.sequence()`.
 
 - `grant_lease` rejects a zero duration and any duration whose expiry would
   overflow `u32`. An expired lease may be replaced by a new grant.
+- **`granted_at` is preserved on re-grant (fixes #206).** When an expired lease
+  is replaced by a new grant, `granted_at` is kept from the original record so
+  that callers can always trace the first issuance date. `expires_at` and
+  `duration_ledgers` are always set from the new call.
+
+  *Expire-then-regrant example:*
+
+  | Ledger | Action | `granted_at` | `expires_at` |
+  |---|---|---|---|
+  | 1000 | `grant_lease(res, buyer, 500)` | 1000 | 1500 |
+  | 1500 | lease expired | — | — |
+  | 2000 | `grant_lease(res, buyer, 300)` | **1000** (preserved) | 2300 |
+
+  The original `granted_at = 1000` is kept across the re-grant at ledger 2000.
+
 - `grant_lease` does **not** verify that `resource_id` exists in
   `vault-registry`; see [Cross-contract trust model](#cross-contract-trust-model).
 - `extend_lease` computes `max(expires_at, now) + extra_ledgers`, so an expired
   lease restarts from the current ledger. Zero / overflowing extensions are rejected.
-- `revoke_lease` deletes the record.
+- `revoke_lease` deletes the record. After a revocation there is no prior-lease
+  record to inherit `granted_at` from, so a subsequent `grant_lease` on the
+  same `(resource_id, buyer)` pair sets a fresh `granted_at`.
 
 ### Storage
 

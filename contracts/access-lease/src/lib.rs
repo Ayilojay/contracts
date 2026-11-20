@@ -26,6 +26,15 @@ const BUMP_THRESH: u32 = PERSISTENT_TTL_THRESHOLD;
 /// Maximum accepted length (in bytes) of a `resource_id`.
 pub const MAX_RESOURCE_ID_LEN: u32 = 64;
 
+/// Maximum accepted lease duration in ledgers.
+///
+/// The contract enforces no upper bound on duration beyond the natural `u32`
+/// overflow check (`now + duration` must not exceed `u32::MAX`).  This
+/// constant expresses that policy: any duration that does not overflow is
+/// accepted.  It is used by the property test suite to model the rejection
+/// branch; at runtime, the only cap is the overflow guard.
+pub const MAX_LEASE_DURATION: u32 = u32::MAX;
+
 /// Contract version, sourced from Cargo.toml at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -399,11 +408,18 @@ impl AccessLease {
         let key = DataKey::Lease(resource_id.clone(), buyer.clone());
         let now = env.ledger().sequence();
 
-        if let Some(existing) = env.storage().persistent().get::<_, Lease>(&key) {
-            if existing.expires_at > now {
-                return Err(Error::AlreadyActive);
-            }
-        }
+        // Preserve the original `granted_at` on re-grant: when an expired
+        // lease exists its `granted_at` is kept so that grant history is never
+        // reset (see docs/CONTRACTS.md § access-lease Semantics).
+        let prior_granted_at: Option<u32> =
+            if let Some(existing) = env.storage().persistent().get::<_, Lease>(&key) {
+                if existing.expires_at > now {
+                    return Err(Error::AlreadyActive);
+                }
+                Some(existing.granted_at)
+            } else {
+                None
+            };
 
         let expires_at = now
             .checked_add(duration_ledgers)
@@ -411,7 +427,7 @@ impl AccessLease {
         let lease = Lease {
             resource_id: resource_id.clone(),
             buyer: buyer.clone(),
-            granted_at: now,
+            granted_at: prior_granted_at.unwrap_or(now),
             expires_at,
             duration_ledgers,
         };
@@ -670,14 +686,16 @@ mod tests {
         let (env, client, _admin) = setup();
         let buyer = Address::generate(&env);
         let rid = String::from_str(&env, "r");
-        client.grant_lease(&rid, &buyer, &100u32);
+        let first = client.grant_lease(&rid, &buyer, &100u32);
         assert_eq!(
             client.try_grant_lease(&rid, &buyer, &100u32),
             Err(Ok(Error::AlreadyActive))
         );
         advance(&env, 100);
         let lease = client.grant_lease(&rid, &buyer, &50u32);
-        assert_eq!(lease.granted_at, env.ledger().sequence());
+        // granted_at is preserved from the original grant (grant history is never reset).
+        assert_eq!(lease.granted_at, first.granted_at);
+        assert_eq!(lease.expires_at, env.ledger().sequence() + 50);
         assert!(client.is_valid(&rid, &buyer));
     }
 
