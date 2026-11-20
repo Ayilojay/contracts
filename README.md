@@ -279,3 +279,6 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-232 -->
 - #232: [subscription] Expose the billing cycle length through the contract interface
+
+<!-- handsoff-issue-191 -->
+- #191: [vault-registry] Stop full listing scans at the recorded resource count
