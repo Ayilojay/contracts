@@ -182,6 +182,39 @@ jobs:
           cat SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Generate build manifest
+        run: |
+          cd target/wasm32v1-none/release
+          # Capture toolchain and source metadata so artifacts are reproducible.
+          rustc_version=$(rustc --version)
+          cargo_version=$(cargo --version)
+          stellar_version=$(stellar --version | head -n1)
+          sdk_version=$(grep -m1 '^name = "soroban-sdk"' -A1 Cargo.lock 2>/dev/null | sed -n 's/^version = "\(.*\)"/\1/p' || true)
+          if [ -z "$sdk_version" ]; then
+            sdk_version=$(grep -m1 'soroban-sdk' ../../../../Cargo.lock -A1 2>/dev/null | sed -n 's/^version = "\(.*\)"/\1/p' || true)
+          fi
+          cat > build-manifest.json <<EOF
+          {
+            "commit": "${GITHUB_SHA}",
+            "ref": "${GITHUB_REF}",
+            "repository": "${GITHUB_REPOSITORY}",
+            "run_id": "${GITHUB_RUN_ID}",
+            "rustc": "${rustc_version}",
+            "cargo": "${cargo_version}",
+            "stellar_cli": "${stellar_version}",
+            "soroban_sdk": "${sdk_version}",
+            "target": "wasm32v1-none"
+          }
+          EOF
+          echo "Generated build manifest:"
+          cat build-manifest.json
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Build manifest" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat build-manifest.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload WASM artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -189,4 +222,5 @@ jobs:
           path: |
             target/wasm32v1-none/release/*.wasm
             target/wasm32v1-none/release/SHA256SUMS
+            target/wasm32v1-none/release/build-manifest.json
           retention-days: 14
