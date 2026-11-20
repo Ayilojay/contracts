@@ -284,9 +284,9 @@ Any tag byte outside this range causes `InvalidTag`.
 | `upgrade(new_wasm_hash)` | Admin | `()` | `NotInitialised` |
 | `migrate()` | Admin | `()` — refreshes the stored version after `upgrade` | `NotInitialised` |
 | `register(creator, id, price, metadata, tags)` | `creator` | `()` | `InvalidResourceId`, `InvalidPrice`, `MetadataTooLong`, `MetadataEmpty`, `InvalidTag`, `AlreadyRegistered` |
-| `set_price(id, new_price)` | Creator | `()` | `InvalidResourceId`, `NotFound`, `InvalidPrice` |
-| `update_metadata(id, metadata)` | Creator | `()` | `InvalidResourceId`, `NotFound`, `MetadataEmpty`, `MetadataTooLong` |
-| `set_tags(id, tags)` | Creator | `()` | `InvalidResourceId`, `NotFound`, `InvalidTag` |
+| `set_price(id, new_price)` | Creator | `()` — no-op if price is unchanged (#201) | `InvalidResourceId`, `NotFound`, `InvalidPrice` |
+| `update_metadata(id, metadata)` | Creator | `()` — no-op if pointer is unchanged (#199) | `InvalidResourceId`, `NotFound`, `MetadataEmpty`, `MetadataTooLong` |
+| `set_tags(id, tags)` | Creator | `()` — no-op if normalised tags are unchanged (#200) | `InvalidResourceId`, `NotFound`, `InvalidTag` |
 | `propose_transfer(id, new_creator)` | Creator | `()` | `InvalidResourceId`, `NotFound` |
 | `accept_transfer(id, new_creator)` | `new_creator` | `()` | `InvalidResourceId`, `NotFound`, `NoPendingTransfer`, `NotPendingOwner` |
 | `cancel_transfer(id)` | Creator | `()` | `InvalidResourceId`, `NotFound` |
@@ -396,8 +396,25 @@ to do this.
 | `("canceltrans", id)` | `()` |
 | `("setlisted", id)` | listed |
 | `("delist", id)` | creator |
-| `("retire", id)` | `()` |
+| `("retire", id)` | admin address |
 | `("upgrade",)` | new wasm hash |
+
+**No-op semantics (#199, #200, #201):** `set_price`, `update_metadata`, and
+`set_tags` are all no-ops when the supplied value, after validation and
+normalisation, is identical to the value already stored. No storage write
+occurs and no event is emitted. `set_listed` and `delist` have the same
+no-op behaviour (unchanged from before).
+
+**Retirement vs delisting (#202):** retirement and delisting are distinct
+signals. `delist` / `set_listed(id, false)` emit `("delist", id)` and are
+reversible (the creator can re-list). `retire_resource` emits `("retire", id)`
+and is permanent (the resource cannot be re-listed or mutated). Discovery
+clients and indexers **must** subscribe to both events:
+
+- `("delist", id)` — resource temporarily removed from discovery; may return.
+- `("retire", id)` — resource permanently removed from discovery; will not return.
+
+Listening only to `delist` will miss retirements.
 
 ### Errors
 

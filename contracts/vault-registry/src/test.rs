@@ -1938,3 +1938,300 @@ fn gas_max_payload_full_page_budget() {
         "max-payload register too expensive: {reg_cpu}"
     );
 }
+
+// ── #199: update_metadata no-op when pointer is unchanged ────────────────────
+
+/// Calling `update_metadata` with the same pointer that is already stored must
+/// not write to storage (TTL unchanged) and must not emit any event.
+#[test]
+fn update_metadata_no_op_when_pointer_unchanged() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "meta-noop");
+    let meta = String::from_str(&env, "ipfs://QmSame");
+
+    client.register(&creator, &id, &100i128, &meta, &empty_tags(&env));
+
+    let ttl_before = resource_storage_ttl(&env, &client.address, &id);
+    env.events().all(); // clear previous events
+
+    client.update_metadata(&id, &meta);
+
+    // No event emitted.
+    let events = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(
+        events.events().len(),
+        0,
+        "expected no event on no-op update_metadata"
+    );
+
+    // TTL must not have been bumped (no storage write).
+    let ttl_after = resource_storage_ttl(&env, &client.address, &id);
+    assert_eq!(ttl_before, ttl_after, "TTL must not change on no-op update_metadata");
+}
+
+/// A real metadata change must still emit exactly one event.
+#[test]
+fn update_metadata_emits_event_when_pointer_changes() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "meta-change");
+    let old_meta = String::from_str(&env, "ipfs://QmOld");
+    let new_meta = String::from_str(&env, "ipfs://QmNew");
+
+    client.register(&creator, &id, &100i128, &old_meta, &empty_tags(&env));
+    env.events().all(); // clear
+
+    client.update_metadata(&id, &new_meta);
+
+    let events = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(events.events().len(), 1, "expected exactly one updmeta event");
+    assert_eq!(
+        events,
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("updmeta"), id.clone()).into_val(&env),
+                new_meta.into_val(&env),
+            ),
+        ]
+    );
+}
+
+// ── #200: set_tags no-op when normalised tags are unchanged ───────────────────
+
+/// Supplying the identical tag vector (already-lowercase) must not write to
+/// storage and must not emit any event.
+#[test]
+fn set_tags_no_op_when_tags_unchanged() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "tags-noop");
+    let initial_tags = tags(&env, &["alpha", "beta"]);
+
+    client.register(&creator, &id, &100i128, &String::from_str(&env, "m"), &initial_tags);
+
+    let ttl_before = resource_storage_ttl(&env, &client.address, &id);
+    env.events().all(); // clear
+
+    client.set_tags(&id, &initial_tags);
+
+    let events = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(
+        events.events().len(),
+        0,
+        "expected no event on no-op set_tags"
+    );
+    let ttl_after = resource_storage_ttl(&env, &client.address, &id);
+    assert_eq!(ttl_before, ttl_after, "TTL must not change on no-op set_tags");
+}
+
+/// Supplying uppercase equivalents that normalise to the already-stored tags
+/// must also be a no-op.
+#[test]
+fn set_tags_no_op_when_case_equivalent_to_stored() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "tags-case-noop");
+
+    // Register with lowercase tags.
+    let stored_tags = tags(&env, &["dataset", "research"]);
+    client.register(&creator, &id, &100i128, &String::from_str(&env, "m"), &stored_tags);
+
+    env.events().all(); // clear
+
+    // Supply the same tags in uppercase — normalisation yields the same stored vector.
+    let upper_tags = tags(&env, &["DATASET", "RESEARCH"]);
+    client.set_tags(&id, &upper_tags);
+
+    let events = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(
+        events.events().len(),
+        0,
+        "case-equivalent tags must produce a no-op"
+    );
+    // Stored tags must remain unchanged.
+    let r = client.get(&id);
+    assert_eq!(r.tags.get(0).unwrap(), String::from_str(&env, "dataset"));
+    assert_eq!(r.tags.get(1).unwrap(), String::from_str(&env, "research"));
+}
+
+/// A real tag change must still emit exactly one event.
+#[test]
+fn set_tags_emits_event_when_tags_change() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "tags-change");
+
+    client.register(&creator, &id, &100i128, &String::from_str(&env, "m"), &empty_tags(&env));
+    env.events().all(); // clear
+
+    let new_tags = tags(&env, &["finance"]);
+    client.set_tags(&id, &new_tags);
+
+    let events = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(events.events().len(), 1, "expected exactly one settags event");
+    assert_eq!(
+        events,
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("settags"), id.clone()).into_val(&env),
+                new_tags.into_val(&env),
+            ),
+        ]
+    );
+}
+
+// ── #201: set_price no-op when price is unchanged ─────────────────────────────
+
+/// Calling `set_price` with the same price already stored must not write to
+/// storage (TTL unchanged) and must not emit any event.
+#[test]
+fn set_price_no_op_when_price_unchanged() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "price-noop");
+
+    client.register(&creator, &id, &500i128, &String::from_str(&env, "m"), &empty_tags(&env));
+
+    let ttl_before = resource_storage_ttl(&env, &client.address, &id);
+    env.events().all(); // clear
+
+    client.set_price(&id, &500i128);
+
+    let events = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(
+        events.events().len(),
+        0,
+        "expected no event on no-op set_price"
+    );
+    let ttl_after = resource_storage_ttl(&env, &client.address, &id);
+    assert_eq!(ttl_before, ttl_after, "TTL must not change on no-op set_price");
+}
+
+/// A real price change must still emit exactly one event.
+#[test]
+fn set_price_emits_event_when_price_changes() {
+    let (env, creator, client) = setup();
+    let id = String::from_str(&env, "price-change");
+
+    client.register(&creator, &id, &100i128, &String::from_str(&env, "m"), &empty_tags(&env));
+    env.events().all(); // clear
+
+    client.set_price(&id, &999i128);
+
+    let events = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(events.events().len(), 1, "expected exactly one setprice event");
+    assert_eq!(
+        events,
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("setprice"), id.clone()).into_val(&env),
+                999i128.into_val(&env),
+            ),
+        ]
+    );
+}
+
+// ── #202: retire_resource event handling for discovery clients ────────────────
+
+/// Retiring a resource emits `("retire", id)` and does NOT emit a `delist`
+/// event. Discovery clients must subscribe to `retire` as a distinct,
+/// permanent-removal signal.
+#[test]
+fn retire_emits_retire_not_delist() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VaultRegistry, ());
+    let client = VaultRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+
+    client.init(&admin);
+    let id = String::from_str(&env, "retire-ev");
+    client.register(&creator, &id, &100i128, &String::from_str(&env, "m"), &empty_tags(&env));
+    env.events().all(); // clear
+
+    client.retire_resource(&id);
+
+    let events = env.events().all().filter_by_contract(&client.address);
+
+    // Exactly one event: ("retire", id) | admin.
+    assert_eq!(events.events().len(), 1, "retire must emit exactly one event");
+    assert_eq!(
+        events,
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("retire"), id.clone()).into_val(&env),
+                admin.clone().into_val(&env),
+            ),
+        ],
+        "retire must emit the retire event, not delist"
+    );
+
+    // Confirm the resource state: listed=false, retired=true.
+    let r = client.get(&id);
+    assert!(!r.listed, "retired resource must have listed=false");
+    assert!(r.retired, "retired resource must have retired=true");
+}
+
+/// Indexer event-sequence demonstration: a resource goes through the full
+/// discovery lifecycle (register → delist → re-list → retire) and the event
+/// stream is authoritative for each transition.
+#[test]
+fn retire_discovery_event_sequence() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VaultRegistry, ());
+    let client = VaultRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+
+    client.init(&admin);
+    let id = String::from_str(&env, "lifecycle");
+
+    // 1. register — resource enters discovery.
+    client.register(&creator, &id, &100i128, &String::from_str(&env, "m"), &empty_tags(&env));
+    let ev = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(ev.events().len(), 1);
+    // topic[0] == "register"
+
+    // 2. delist — temporary removal; a re-list is still possible.
+    client.delist(&id);
+    let ev = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(ev.events().len(), 1);
+    // topic[0] == "delist"
+
+    // 3. re-list — back in discovery.
+    client.set_listed(&id, &true);
+    let ev = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(ev.events().len(), 1);
+    // topic[0] == "setlisted"
+
+    // 4. retire — permanent removal; no further mutations possible.
+    client.retire_resource(&id);
+    let ev = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(ev.events().len(), 1, "retire must emit exactly one event");
+    // The event must be "retire", confirming the authoritative retirement signal.
+    assert_eq!(
+        ev,
+        soroban_sdk::vec![
+            &env,
+            (
+                client.address.clone(),
+                (symbol_short!("retire"), id.clone()).into_val(&env),
+                admin.into_val(&env),
+            ),
+        ]
+    );
+
+    // After retirement the resource is permanently unlisted and immutable.
+    assert!(!client.get(&id).listed);
+    assert!(client.get(&id).retired);
+    assert_eq!(
+        client.try_set_listed(&id, &true),
+        Err(Ok(Error::ResourceRetired)),
+        "retired resource cannot be re-listed"
+    );
+}
