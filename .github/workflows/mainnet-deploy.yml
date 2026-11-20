@@ -7,9 +7,14 @@ on:
         description: 'Type "deploy-mainnet" to confirm mainnet deployment'
         required: true
         type: string
+      resume_run_id:
+        description: 'Optional: run ID of a previous mainnet deploy to resume (reuses its checkpoint artifact)'
+        required: false
+        type: string
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   confirm:
@@ -38,6 +43,7 @@ jobs:
       NETWORK_PASSPHRASE: "Public Global Stellar Network ; September 2015"
       DEPLOYER_SECRET: ${{ secrets.MAINNET_DEPLOYER_SECRET }}
       ADMIN_PUBLIC: ${{ secrets.MAINNET_ADMIN_PUBLIC }}
+      RESUME_RUN_ID: ${{ github.event.inputs.resume_run_id }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -101,23 +107,65 @@ jobs:
             exit 1
           fi
 
+      - name: Restore checkpoint (resume)
+        if: ${{ github.event.inputs.resume_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p deployed/checkpoints
+          gh run download "$RESUME_RUN_ID" \
+            --repo "${{ github.repository }}" \
+            --name mainnet-deploy-checkpoint \
+            --dir deployed/checkpoints
+          echo "Restored checkpoint from run $RESUME_RUN_ID:"
+          cat deployed/checkpoints/*.env 2>/dev/null || true
+
       - name: Deploy + init contracts
         run: |
           set -euo pipefail
+          mkdir -p deployed/checkpoints
           for PKG in vault_registry access_lease subscription; do
+            VAR=$(echo "$PKG" | tr '[:lower:]' '[:upper:]')
+            CHECKPOINT="deployed/checkpoints/${PKG}.env"
+            if [ -f "$CHECKPOINT" ]; then
+              # shellcheck disable=SC1090
+              . "$CHECKPOINT"
+              if [ -n "${CONTRACT_ID:-}" ]; then
+                echo "::notice::Resuming ${PKG}; reusing existing ID ${CONTRACT_ID}"
+                echo "${VAR}=${CONTRACT_ID}" >> "$GITHUB_ENV"
+                continue
+              fi
+            fi
             ID=$(stellar contract deploy \
               --wasm "target/wasm32v1-none/release/${PKG}.wasm" \
               --source-account "$DEPLOYER_SECRET" \
               --network "$NETWORK")
             echo "::notice::${PKG}=${ID}"
+            {
+              echo "CONTRACT_ID=${ID}"
+              echo "PACKAGE=${PKG}"
+              echo "DEPLOY_STATUS=deployed"
+              echo "DEPLOYED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            } > "$CHECKPOINT"
             stellar contract invoke \
               --id "$ID" \
               --source-account "$DEPLOYER_SECRET" \
               --network "$NETWORK" \
               -- init --admin "$ADMIN_PUBLIC"
-            VAR=$(echo "$PKG" | tr '[:lower:]' '[:upper:]')
+            echo "INIT_STATUS=initialized" >> "$CHECKPOINT"
+            echo "INIT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$CHECKPOINT"
             echo "${VAR}=${ID}" >> "$GITHUB_ENV"
           done
+
+      - name: Upload checkpoint artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mainnet-deploy-checkpoint
+          path: deployed/checkpoints/
+          if-no-files-found: warn
+          retention-days: 90
 
       - name: Write contract IDs
         run: |
