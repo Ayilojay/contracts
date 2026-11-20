@@ -168,9 +168,25 @@ jobs:
             fi
           done
 
+      - name: Generate SHA-256 checksum manifest
+        run: |
+          cd target/wasm32v1-none/release
+          # sha256sum emits `<hash>  <filename>` lines, one per binary.
+          sha256sum *.wasm > SHA256SUMS
+          echo "Generated checksum manifest:"
+          cat SHA256SUMS
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### SHA-256 checksums" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload WASM artifacts
         uses: actions/upload-artifact@v7
         with:
           name: wasm-contracts
-          path: target/wasm32v1-none/release/*.wasm
+          path: |
+            target/wasm32v1-none/release/*.wasm
+            target/wasm32v1-none/release/SHA256SUMS
           retention-days: 14

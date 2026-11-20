@@ -76,6 +76,25 @@ Notes:
   in `contracts/vault-registry` if the registry's interface changes.
 - Error codes are part of the public ABI: append new variants, never renumber.
 
+## Verifying downloaded WASM artifacts
+
+CI uploads the built WASM binaries together with a `SHA256SUMS` manifest that
+maps each filename to its SHA-256 digest. After downloading the artifact, verify
+that the bytes you have match the manifest before deploying:
+
+```bash
+# From the directory containing the downloaded .wasm files and SHA256SUMS
+sha256sum --check SHA256SUMS
+```
+
+On macOS use `shasum -a 256 --check SHA256SUMS` instead. Every line should
+report `OK`; any `FAILED` line means the file was corrupted or tampered with and
+must not be deployed. To inspect a single digest manually:
+
+```bash
+sha256sum vault_registry.wasm
+```
+
 ## Adding a new contract
 
 1. `mkdir -p contracts/my-contract/src`
