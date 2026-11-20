@@ -1,10 +1,27 @@
 name: Testnet Deploy
 
+# Triggers a testnet deployment when shared build inputs change.
+#
+# Deploys on push to main when any of the following change:
+#   - contracts/**            (contract source)
+#   - Cargo.toml / Cargo.lock (workspace manifest + locked dependency graph)
+#   - rust-toolchain.toml     (pinned toolchain)
+#   - .github/workflows/testnet-deploy.yml (this workflow)
+#
+# Intentionally does NOT deploy on changes to:
+#   - docs/**                 (documentation only)
+#   - deployed/**             (deploy output committed by this workflow)
+#   - other workflows / non-build files (e.g. README, .gitignore)
+# Use workflow_dispatch to force a deploy when needed.
+
 on:
   push:
     branches: [main]
     paths:
       - 'contracts/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
       - '.github/workflows/testnet-deploy.yml'
   workflow_dispatch:
 
