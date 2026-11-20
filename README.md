@@ -285,3 +285,6 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-192 -->
 - #192: [vault-registry] Make registration counter exhaustion explicit
+
+<!-- handsoff-issue-193 -->
+- #193: [vault-registry] Offer bounded multi-resource reads
