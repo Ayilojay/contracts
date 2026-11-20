@@ -11,6 +11,9 @@ on:
 permissions:
   contents: write
 
+env:
+  STELLAR_CLI_VERSION: "27.0.0"
+
 jobs:
   confirm:
     name: Confirmation Gate
@@ -56,10 +59,10 @@ jobs:
         with:
           targets: wasm32v1-none
 
-      - name: Install Stellar CLI v27
+      - name: Install Stellar CLI v${{ env.STELLAR_CLI_VERSION }}
         run: |
           curl -sL \
-            https://github.com/stellar/stellar-cli/releases/download/v27.0.0/stellar-cli-27.0.0-x86_64-unknown-linux-gnu.tar.gz \
+            "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
             | sudo tar xz -C /usr/local/bin
           stellar --version
 
