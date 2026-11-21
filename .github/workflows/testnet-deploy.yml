@@ -17,8 +17,20 @@ on:
       - "contracts/**"
       - ".github/workflows/testnet-deploy.yml"
 
+# Serialize deployments per network so overlapping runs cannot deploy contracts
+# or write the same manifest path concurrently.
+#
+# Cancellation behavior:
+# - `cancel-in-progress: false` means a newly queued run waits for the in-flight
+#   deployment to finish instead of cancelling it. This prevents a partially
+#   applied deployment (some contracts deployed, manifest not yet written) from
+#   being interrupted mid-flight.
+# - At most one run per network is active and one is pending; additional queued
+#   runs supersede the older pending run (GitHub keeps only the latest pending).
+# - The group is keyed on the resolved network so testnet and futurenet deploys
+#   do not block each other.
 concurrency:
-  group: testnet-deploy-${{ github.ref }}
+  group: testnet-deploy-${{ github.event.inputs.network || 'testnet' }}
   cancel-in-progress: false
 
 permissions:
