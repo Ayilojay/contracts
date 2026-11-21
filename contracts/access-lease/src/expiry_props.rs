@@ -217,6 +217,8 @@ proptest! {
         client.grant_lease(&rid, &buyer, &duration);
 
         let new_admin = Address::generate(&env);
+        // propose first so accept_admin has a pending proposal.
+        client.propose_admin(&new_admin);
         client.accept_admin(&new_admin);
 
         let names = emitted_event_names(&env);

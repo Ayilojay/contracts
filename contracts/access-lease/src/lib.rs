@@ -12,6 +12,10 @@ use soroban_sdk::{
 
 const DAY: u32 = 17_280; // ~5s/ledger × 17280 = 1 day
 
+/// Number of ledgers a pending-admin proposal is valid for after it is created
+/// (~30 days at ~5 s/ledger).
+pub const ADMIN_PROPOSAL_TTL_LEDGERS: u32 = 30 * DAY;
+
 /// Persistent-storage TTL policy for this contract.
 const PERSISTENT_TTL: u32 = 90 * DAY;
 /// Threshold at which a persistent entry's TTL is refreshed on access.
@@ -53,30 +57,25 @@ pub struct Lease {
     pub duration_ledgers: u32,
 }
 
-/// The result of [`AccessLease::lease_status`] — a structured alternative to
-/// the boolean [`is_valid`] that lets callers distinguish three states without
-/// a separate [`get_lease`] call.
+/// A pending admin proposal, storing both the nominee and the ledger by which
+/// acceptance must occur.
 ///
-/// - `Missing`  — no record exists (never granted, or previously revoked).
-/// - `Active`   — lease exists and `expires_at > ledger.sequence()`.
-///                `remaining_ledgers` is `expires_at - ledger.sequence()`.
-/// - `Expired`  — lease exists but `expires_at <= ledger.sequence()`.
-///                `remaining_ledgers` is `0`.
-///
-/// `Active` and `Expired` both extend the persistent-entry TTL, matching the
-/// behaviour of [`is_valid`] and [`get_lease`].
+/// `accept_admin` checks that `ledger.sequence() <= deadline` before promoting
+/// the nominee.  After the deadline the proposal is treated as expired and
+/// `accept_admin` returns [`Error::AdminProposalExpired`].
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
-pub enum LeaseStatus {
-    Missing,
-    Active(u32),  // remaining_ledgers
-    Expired,
+pub struct PendingAdminProposal {
+    /// The nominated address that must call `accept_admin`.
+    pub pending_admin: Address,
+    /// The last ledger (inclusive) on which acceptance is still valid.
+    pub deadline: u32,
 }
 
 #[contracttype]
 pub enum DataKey {
     Admin,
-    /// Pending admin address awaiting acceptance via `accept_admin`.
+    /// Pending admin proposal awaiting acceptance via `accept_admin`.
     PendingAdmin,
     Lease(String, Address),
     Version,
@@ -111,6 +110,12 @@ pub enum Error {
     BatchTooLarge = 12,
     /// `cancel_admin_proposal` was called but no proposal is pending.
     NoPendingProposal = 13,
+    /// `accept_admin` was called after the proposal deadline passed.
+    AdminProposalExpired = 14,
+    /// `propose_admin` was called with an address that is already the current admin.
+    AlreadyAdmin = 15,
+    /// `propose_admin` was called with an address that is already the pending admin.
+    AlreadyPendingAdmin = 16,
 }
 
 #[contractevent(topics = ["init"], data_format = "single-value")]
@@ -231,12 +236,50 @@ impl AccessLease {
     /// The current admin nominates `pending_admin`.  The proposal is stored in
     /// instance storage and must be accepted by `pending_admin` via
     /// [`accept_admin`] to take effect.  Calling `propose_admin` again
-    /// overwrites any previous pending proposal.
+    /// overwrites any previous pending proposal, unless the nominee is the same
+    /// as the current pending admin (returns [`Error::AlreadyPendingAdmin`]) or
+    /// is already the active admin (returns [`Error::AlreadyAdmin`]).
+    ///
+    /// A deadline of `now + ADMIN_PROPOSAL_TTL_LEDGERS` is recorded with the
+    /// proposal; `accept_admin` will reject acceptance after this ledger.
     pub fn propose_admin(env: Env, pending_admin: Address) -> Result<(), Error> {
         Self::require_admin(&env)?;
-        env.storage()
+
+        // Guard #213: reject a nomination of the already-active admin.
+        let current: Address = env
+            .storage()
             .instance()
-            .set(&DataKey::PendingAdmin, &pending_admin);
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialised)?;
+        if pending_admin == current {
+            return Err(Error::AlreadyAdmin);
+        }
+
+        // Guard #213: reject a re-nomination of the already-pending admin.
+        if let Some(existing) = env
+            .storage()
+            .instance()
+            .get::<_, PendingAdminProposal>(&DataKey::PendingAdmin)
+        {
+            if pending_admin == existing.pending_admin {
+                return Err(Error::AlreadyPendingAdmin);
+            }
+        }
+
+        // #211: attach an acceptance deadline.
+        let deadline = env
+            .ledger()
+            .sequence()
+            .checked_add(ADMIN_PROPOSAL_TTL_LEDGERS)
+            .unwrap_or(u32::MAX);
+
+        env.storage().instance().set(
+            &DataKey::PendingAdmin,
+            &PendingAdminProposal {
+                pending_admin: pending_admin.clone(),
+                deadline,
+            },
+        );
         env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
         ProposeAdminEvent { pending_admin }.publish(&env);
         Ok(())
@@ -247,17 +290,22 @@ impl AccessLease {
     /// `pending_admin` must sign this call.  On success the caller becomes the
     /// new admin, the pending-admin slot is cleared, and a `setadmin` event is
     /// emitted.  Reverts with [`Error::NoPendingAdmin`] if no proposal is
-    /// outstanding, or [`Error::NotPendingAdmin`] if the caller is not the
-    /// nominated address.
+    /// outstanding, [`Error::NotPendingAdmin`] if the caller is not the
+    /// nominated address, or [`Error::AdminProposalExpired`] if the acceptance
+    /// deadline has passed.
     pub fn accept_admin(env: Env, pending_admin: Address) -> Result<(), Error> {
         // Verify that a proposal exists and the caller matches.
-        let stored: Address = env
+        let proposal: PendingAdminProposal = env
             .storage()
             .instance()
             .get(&DataKey::PendingAdmin)
             .ok_or(Error::NoPendingAdmin)?;
-        if stored != pending_admin {
+        if proposal.pending_admin != pending_admin {
             return Err(Error::NotPendingAdmin);
+        }
+        // #211: reject acceptance after the deadline.
+        if env.ledger().sequence() > proposal.deadline {
+            return Err(Error::AdminProposalExpired);
         }
         // The pending admin must authorise this call.
         pending_admin.require_auth();
@@ -290,7 +338,7 @@ impl AccessLease {
     /// then fail with [`Error::NoPendingAdmin`].
     pub fn cancel_admin_proposal(env: Env) -> Result<(), Error> {
         Self::require_admin(&env)?;
-        let pending: Address = env
+        let proposal: PendingAdminProposal = env
             .storage()
             .instance()
             .get(&DataKey::PendingAdmin)
@@ -298,7 +346,7 @@ impl AccessLease {
         env.storage().instance().remove(&DataKey::PendingAdmin);
         env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
         CancelAdminProposalEvent {
-            cancelled_pending_admin: pending,
+            cancelled_pending_admin: proposal.pending_admin,
         }
         .publish(&env);
         Ok(())
@@ -306,6 +354,14 @@ impl AccessLease {
 
     /// Return the pending admin address, if any proposal is outstanding.
     pub fn pending_admin(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get::<_, PendingAdminProposal>(&DataKey::PendingAdmin)
+            .map(|p| p.pending_admin)
+    }
+
+    /// Return the pending admin proposal (address + deadline), if any.
+    pub fn pending_admin_proposal(env: Env) -> Option<PendingAdminProposal> {
         env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
@@ -681,9 +737,18 @@ mod tests {
     };
 
     /// Real WASM for success-path `upgrade` tests: the host rejects a hash
-    /// that was never uploaded. Reuses the vault-registry upgrade fixture.
+    /// that was never uploaded.
+    ///
+    /// This fixture is built from the `access-lease` package itself via
+    /// `make fixture` in `contracts/access-lease/` (issue #214).  It exercises
+    /// the lease-specific entrypoints after an upgrade, including post-upgrade
+    /// lease reads, admin authorisation checks, and migration, using the
+    /// upgraded contract interface.
+    ///
+    /// **To regenerate:** run `make fixture` from `contracts/access-lease/`.
+    /// The resulting WASM is committed as a reproducible build artefact.
     const UPGRADE_TARGET_WASM: &[u8] =
-        include_bytes!("../../vault-registry/fixtures/vault_registry_upgrade_target.wasm");
+        include_bytes!("../fixtures/access_lease_upgrade_target.wasm");
 
     fn uploaded_wasm_hash(env: &Env) -> BytesN<32> {
         env.deployer().upload_contract_wasm(UPGRADE_TARGET_WASM)
@@ -831,6 +896,64 @@ mod tests {
         let hash = uploaded_wasm_hash(&env);
         client.upgrade(&hash);
         // Auth checks passed successfully
+    }
+
+    // ── Issue #214: post-upgrade lease interface verification ─────────────────
+
+    /// After upgrading with the lease-specific fixture, existing leases are
+    /// still readable and `is_valid` works correctly.
+    #[test]
+    fn upgrade_preserves_lease_reads() {
+        let (env, client, _admin) = setup();
+        let buyer = Address::generate(&env);
+        let rid = String::from_str(&env, "res_upgrade");
+
+        // Grant a lease before upgrading.
+        let lease_before = client.grant_lease(&rid, &buyer, &500u32);
+
+        // Upgrade the contract WASM.
+        let hash = uploaded_wasm_hash(&env);
+        client.upgrade(&hash);
+
+        // After upgrade, the stored lease is still readable.
+        let lease_after = client.get_lease(&rid, &buyer);
+        assert_eq!(lease_before, lease_after);
+        assert!(client.is_valid(&rid, &buyer));
+    }
+
+    /// After upgrading, admin-gated entrypoints still require the admin's auth.
+    #[test]
+    fn upgrade_preserves_admin_auth() {
+        let (env, client, admin) = setup();
+        let buyer = Address::generate(&env);
+        let rid = String::from_str(&env, "r");
+
+        let hash = uploaded_wasm_hash(&env);
+        client.upgrade(&hash);
+
+        // grant_lease must still check the admin.
+        client.grant_lease(&rid, &buyer, &100u32);
+        assert_eq!(env.auths()[0].0, admin);
+    }
+
+    /// After upgrading, `migrate` updates the stored version.
+    #[test]
+    fn upgrade_then_migrate_updates_version() {
+        let (env, client, _admin) = setup();
+
+        let hash = uploaded_wasm_hash(&env);
+        client.upgrade(&hash);
+
+        // Simulate a stale stored version to verify migrate rewrites it.
+        env.as_contract(&client.address, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Version, &String::from_str(&env, "0.0.0"));
+        });
+        assert!(!client.is_compatible());
+
+        client.migrate();
+        assert!(client.is_compatible());
     }
 
     #[test]
@@ -1184,6 +1307,9 @@ mod tests {
         assert_eq!(Error::NotPendingAdmin as u32, 11);
         assert_eq!(Error::BatchTooLarge as u32, 12);
         assert_eq!(Error::NoPendingProposal as u32, 13);
+        assert_eq!(Error::AdminProposalExpired as u32, 14);
+        assert_eq!(Error::AlreadyAdmin as u32, 15);
+        assert_eq!(Error::AlreadyPendingAdmin as u32, 16);
     }
 
     /// Golden XDR-encoded length of a representative [`Lease`].
@@ -1419,352 +1545,216 @@ mod tests {
         assert_eq!(env.auths()[0].0, admin);
     }
 
-    // ── Issue #215: lease_status ──────────────────────────────────────────────
+    // ── Issue #211: acceptance deadline ───────────────────────────────────────
 
+    /// `propose_admin` stores a deadline and `pending_admin_proposal` exposes it.
     #[test]
-    fn lease_status_missing_when_no_record() {
+    fn propose_admin_records_deadline() {
         let (env, client, _admin) = setup();
-        let buyer = Address::generate(&env);
-        let rid = String::from_str(&env, "r");
-        assert_eq!(client.lease_status(&rid, &buyer), LeaseStatus::Missing);
+        let candidate = Address::generate(&env);
+        let now = env.ledger().sequence();
+        client.propose_admin(&candidate);
+
+        let proposal = client.pending_admin_proposal().expect("proposal present");
+        assert_eq!(proposal.pending_admin, candidate);
+        assert_eq!(proposal.deadline, now + ADMIN_PROPOSAL_TTL_LEDGERS);
     }
 
+    /// Acceptance on the last valid ledger (deadline) succeeds.
     #[test]
-    fn lease_status_active_with_remaining_ledgers() {
+    fn accept_admin_at_deadline_succeeds() {
         let (env, client, _admin) = setup();
-        let buyer = Address::generate(&env);
-        let rid = String::from_str(&env, "r");
-        client.grant_lease(&rid, &buyer, &100u32);
-        advance(&env, 30);
-        match client.lease_status(&rid, &buyer) {
-            LeaseStatus::Active(remaining) => assert_eq!(remaining, 70u32),
-            other => panic!("expected Active, got {:?}", other),
-        }
+        let candidate = Address::generate(&env);
+        let now = env.ledger().sequence();
+        client.propose_admin(&candidate);
+
+        // Advance to exactly the deadline.
+        env.ledger()
+            .set_sequence_number(now + ADMIN_PROPOSAL_TTL_LEDGERS);
+        client.accept_admin(&candidate);
+        assert_eq!(client.admin(), candidate);
     }
 
+    /// Acceptance one ledger after the deadline is rejected.
     #[test]
-    fn lease_status_expired_when_past_expiry() {
+    fn accept_admin_after_deadline_is_rejected() {
         let (env, client, _admin) = setup();
-        let buyer = Address::generate(&env);
-        let rid = String::from_str(&env, "r");
-        client.grant_lease(&rid, &buyer, &10u32);
-        advance(&env, 10); // exactly at expires_at — exclusive, so expired
-        assert_eq!(client.lease_status(&rid, &buyer), LeaseStatus::Expired);
-        advance(&env, 5); // well past
-        assert_eq!(client.lease_status(&rid, &buyer), LeaseStatus::Expired);
-    }
+        let candidate = Address::generate(&env);
+        let now = env.ledger().sequence();
+        client.propose_admin(&candidate);
 
-    /// Exact expiry boundary: one ledger before → Active, at expires_at → Expired.
-    #[test]
-    fn lease_status_exact_expiry_boundary() {
-        let (env, client, _admin) = setup();
-        let buyer = Address::generate(&env);
-        let rid = String::from_str(&env, "r");
-        let lease = client.grant_lease(&rid, &buyer, &100u32);
-        let expires_at = lease.expires_at;
-
-        advance(&env, 99); // ledger = expires_at - 1
-        match client.lease_status(&rid, &buyer) {
-            LeaseStatus::Active(remaining) => assert_eq!(remaining, 1u32),
-            other => panic!("expected Active(1), got {:?}", other),
-        }
-
-        advance(&env, 1); // ledger = expires_at exactly
-        assert_eq!(env.ledger().sequence(), expires_at);
-        assert_eq!(client.lease_status(&rid, &buyer), LeaseStatus::Expired);
-    }
-
-    #[test]
-    fn lease_status_missing_after_revoke() {
-        let (env, client, _admin) = setup();
-        let buyer = Address::generate(&env);
-        let rid = String::from_str(&env, "r");
-        client.grant_lease(&rid, &buyer, &100u32);
-        client.revoke_lease(&rid, &buyer);
-        assert_eq!(client.lease_status(&rid, &buyer), LeaseStatus::Missing);
-    }
-
-    // ── Issue #216: check_leases ──────────────────────────────────────────────
-
-    #[test]
-    fn check_leases_returns_ordered_statuses() {
-        let (env, client, _admin) = setup();
-        let b1 = Address::generate(&env);
-        let b2 = Address::generate(&env);
-        let b3 = Address::generate(&env);
-        let r1 = String::from_str(&env, "r1");
-        let r2 = String::from_str(&env, "r2");
-        let r3 = String::from_str(&env, "r3");
-
-        client.grant_lease(&r1, &b1, &100u32);
-        client.grant_lease(&r2, &b2, &10u32);
-        // r3/b3 never granted
-
-        advance(&env, 10); // r2 expires exactly here
-
-        let mut queries = soroban_sdk::Vec::new(&env);
-        queries.push_back((r1.clone(), b1.clone()));
-        queries.push_back((r2.clone(), b2.clone()));
-        queries.push_back((r3.clone(), b3.clone()));
-
-        let results = client.check_leases(&queries);
-        assert_eq!(results.len(), 3);
-        // r1 still active (90 remaining)
-        assert_eq!(results.get_unchecked(0), LeaseStatus::Active(90));
-        // r2 expired
-        assert_eq!(results.get_unchecked(1), LeaseStatus::Expired);
-        // r3 missing
-        assert_eq!(results.get_unchecked(2), LeaseStatus::Missing);
-    }
-
-    #[test]
-    fn check_leases_empty_batch_rejected() {
-        let (env, client, _admin) = setup();
-        let empty: soroban_sdk::Vec<(String, Address)> = soroban_sdk::Vec::new(&env);
+        // Advance one ledger past the deadline.
+        env.ledger()
+            .set_sequence_number(now + ADMIN_PROPOSAL_TTL_LEDGERS + 1);
         assert_eq!(
-            client.try_check_leases(&empty),
-            Err(Ok(Error::InvalidDuration))
+            client.try_accept_admin(&candidate),
+            Err(Ok(Error::AdminProposalExpired)),
+        );
+        // Admin unchanged.
+        assert_ne!(client.admin(), candidate);
+    }
+
+    // ── Issue #212: two-step admin state machine focused tests ────────────────
+
+    /// A proposal can be replaced (A→B then A→C): the new proposal overwrites
+    /// the old one and C (not B) can accept.
+    #[test]
+    fn propose_admin_replacement_overwrites_previous_proposal() {
+        let (env, client, _admin) = setup();
+        let b = Address::generate(&env);
+        let c = Address::generate(&env);
+
+        client.propose_admin(&b);
+        assert_eq!(client.pending_admin(), Some(b.clone()));
+
+        // Replace B with C.
+        client.propose_admin(&c);
+        assert_eq!(client.pending_admin(), Some(c.clone()));
+
+        // B can no longer accept.
+        assert_eq!(
+            client.try_accept_admin(&b),
+            Err(Ok(Error::NotPendingAdmin)),
+        );
+
+        // C can accept.
+        client.accept_admin(&c);
+        assert_eq!(client.admin(), c);
+    }
+
+    /// The current admin can reject (cancel) a proposal before it is accepted.
+    #[test]
+    fn admin_can_reject_own_proposal() {
+        let (env, client, _admin) = setup();
+        let b = Address::generate(&env);
+
+        client.propose_admin(&b);
+        client.cancel_admin_proposal();
+
+        assert_eq!(client.pending_admin(), None);
+        assert_eq!(
+            client.try_accept_admin(&b),
+            Err(Ok(Error::NoPendingAdmin)),
         );
     }
 
+    /// B accepts the proposal and becomes admin; A is no longer admin.
     #[test]
-    fn check_leases_over_max_batch_size_rejected() {
+    fn acceptance_transfers_admin_from_a_to_b() {
+        let (env, client, old_admin) = setup();
+        let b = Address::generate(&env);
+
+        client.propose_admin(&b);
+        client.accept_admin(&b);
+
+        assert_eq!(client.admin(), b);
+        assert_ne!(client.admin(), old_admin);
+        // Pending slot cleared.
+        assert_eq!(client.pending_admin(), None);
+    }
+
+    /// After B accepts, A's admin calls are rejected (old admin has no power).
+    #[test]
+    fn old_admin_cannot_act_after_acceptance() {
+        let (env, client, old_admin) = setup();
+        let b = Address::generate(&env);
+        let c = Address::generate(&env);
+
+        client.propose_admin(&b);
+        client.accept_admin(&b);
+
+        // Now B is admin; mock A's signature for propose_admin.
+        env.mock_auths(&[MockAuth {
+            address: &old_admin,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "propose_admin",
+                args: (c.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_propose_admin(&c).is_err());
+    }
+
+    /// No proposal → `accept_admin` and `cancel_admin_proposal` both fail correctly.
+    #[test]
+    fn no_proposal_errors_are_distinct() {
         let (env, client, _admin) = setup();
-        let mut queries: soroban_sdk::Vec<(String, Address)> = soroban_sdk::Vec::new(&env);
-        for i in 0..=MAX_BATCH_SIZE {
-            let rid = String::from_str(&env, &soroban_sdk::format!(&env, "r{}", i));
-            let buyer = Address::generate(&env);
-            queries.push_back((rid, buyer));
-        }
+        let b = Address::generate(&env);
+
         assert_eq!(
-            client.try_check_leases(&queries),
-            Err(Ok(Error::BatchTooLarge))
+            client.try_accept_admin(&b),
+            Err(Ok(Error::NoPendingAdmin)),
+        );
+        assert_eq!(
+            client.try_cancel_admin_proposal(),
+            Err(Ok(Error::NoPendingProposal)),
         );
     }
 
+    /// `accept_admin` by an address that is not the pending one returns
+    /// `NotPendingAdmin`.
     #[test]
-    fn check_leases_at_max_batch_size_succeeds() {
+    fn accept_admin_wrong_address_returns_not_pending_admin() {
         let (env, client, _admin) = setup();
-        let mut queries: soroban_sdk::Vec<(String, Address)> = soroban_sdk::Vec::new(&env);
-        for i in 0..MAX_BATCH_SIZE {
-            let rid = String::from_str(&env, &soroban_sdk::format!(&env, "r{}", i));
-            let buyer = Address::generate(&env);
-            queries.push_back((rid, buyer));
-        }
-        let results = client.check_leases(&queries);
-        assert_eq!(results.len(), MAX_BATCH_SIZE);
-        // All are missing (none were granted)
-        for i in 0..MAX_BATCH_SIZE {
-            assert_eq!(results.get_unchecked(i), LeaseStatus::Missing);
-        }
-    }
+        let b = Address::generate(&env);
+        let impostor = Address::generate(&env);
 
-    // ── Issue #217: revoke_leases ─────────────────────────────────────────────
-
-    #[test]
-    fn revoke_leases_removes_all_valid_entries() {
-        let (env, client, _admin) = setup();
-        let b1 = Address::generate(&env);
-        let b2 = Address::generate(&env);
-        let r1 = String::from_str(&env, "r1");
-        let r2 = String::from_str(&env, "r2");
-
-        client.grant_lease(&r1, &b1, &100u32);
-        client.grant_lease(&r2, &b2, &100u32);
-
-        let mut pairs = soroban_sdk::Vec::new(&env);
-        pairs.push_back((r1.clone(), b1.clone()));
-        pairs.push_back((r2.clone(), b2.clone()));
-
-        client.revoke_leases(&pairs);
-
-        assert!(!client.is_valid(&r1, &b1));
-        assert!(!client.is_valid(&r2, &b2));
-        assert_eq!(client.try_get_lease(&r1, &b1), Err(Ok(Error::LeaseNotFound)));
-        assert_eq!(client.try_get_lease(&r2, &b2), Err(Ok(Error::LeaseNotFound)));
-    }
-
-    #[test]
-    fn revoke_leases_skips_missing_entries_silently() {
-        let (env, client, _admin) = setup();
-        let b1 = Address::generate(&env);
-        let b2 = Address::generate(&env); // never granted
-        let r1 = String::from_str(&env, "r1");
-        let r2 = String::from_str(&env, "r2");
-
-        client.grant_lease(&r1, &b1, &100u32);
-
-        let mut pairs = soroban_sdk::Vec::new(&env);
-        pairs.push_back((r1.clone(), b1.clone()));
-        pairs.push_back((r2.clone(), b2.clone())); // missing — should not error
-
-        // Must succeed despite missing entry
-        client.revoke_leases(&pairs);
-        assert!(!client.is_valid(&r1, &b1));
-    }
-
-    #[test]
-    fn revoke_leases_duplicate_pair_skipped_after_first() {
-        let (env, client, _admin) = setup();
-        let buyer = Address::generate(&env);
-        let rid = String::from_str(&env, "r");
-
-        client.grant_lease(&rid, &buyer, &100u32);
-
-        let mut pairs = soroban_sdk::Vec::new(&env);
-        pairs.push_back((rid.clone(), buyer.clone()));
-        pairs.push_back((rid.clone(), buyer.clone())); // duplicate
-
-        // Must succeed: second occurrence is a no-op
-        client.revoke_leases(&pairs);
-        assert!(!client.is_valid(&rid, &buyer));
-    }
-
-    #[test]
-    fn revoke_leases_emits_revoke_event_per_removed_entry() {
-        let (env, client, _admin) = setup();
-        let b1 = Address::generate(&env);
-        let b2 = Address::generate(&env);
-        let r1 = String::from_str(&env, "r1");
-        let r2 = String::from_str(&env, "r2");
-
-        client.grant_lease(&r1, &b1, &100u32);
-        client.grant_lease(&r2, &b2, &100u32);
-
-        let mut pairs = soroban_sdk::Vec::new(&env);
-        pairs.push_back((r1.clone(), b1.clone()));
-        pairs.push_back((r2.clone(), b2.clone()));
-
-        client.revoke_leases(&pairs);
-
-        let revoke_sym: soroban_sdk::Val =
-            soroban_sdk::symbol_short!("revoke").into_val(&env);
-        let revoke_count = env
-            .events()
-            .all()
-            .filter_by_contract(&client.address)
-            .iter()
-            .filter(|(_, topics, _)| {
-                !topics.is_empty() && topics.get_unchecked(0) == revoke_sym
-            })
-            .count();
-        assert_eq!(revoke_count, 2);
-    }
-
-    #[test]
-    fn revoke_leases_empty_batch_rejected() {
-        let (env, client, _admin) = setup();
-        let empty: soroban_sdk::Vec<(String, Address)> = soroban_sdk::Vec::new(&env);
+        client.propose_admin(&b);
         assert_eq!(
-            client.try_revoke_leases(&empty),
-            Err(Ok(Error::InvalidDuration))
+            client.try_accept_admin(&impostor),
+            Err(Ok(Error::NotPendingAdmin)),
         );
+        // Proposal is still pending.
+        assert_eq!(client.pending_admin(), Some(b));
     }
 
-    #[test]
-    fn revoke_leases_over_max_batch_size_rejected() {
-        let (env, client, _admin) = setup();
-        let mut pairs: soroban_sdk::Vec<(String, Address)> = soroban_sdk::Vec::new(&env);
-        for i in 0..=MAX_BATCH_SIZE {
-            let rid = String::from_str(&env, &soroban_sdk::format!(&env, "r{}", i));
-            let buyer = Address::generate(&env);
-            pairs.push_back((rid, buyer));
-        }
-        assert_eq!(
-            client.try_revoke_leases(&pairs),
-            Err(Ok(Error::BatchTooLarge))
-        );
-    }
+    // ── Issue #213: duplicate proposal guards ─────────────────────────────────
 
+    /// Proposing the current admin is rejected.
     #[test]
-    fn revoke_leases_requires_admin_auth() {
+    fn propose_admin_to_current_admin_is_rejected() {
         let (env, client, admin) = setup();
-        let buyer = Address::generate(&env);
-        let rid = String::from_str(&env, "r");
-        client.grant_lease(&rid, &buyer, &100u32);
-
-        let mut pairs = soroban_sdk::Vec::new(&env);
-        pairs.push_back((rid.clone(), buyer.clone()));
-
-        client.revoke_leases(&pairs);
-        assert_eq!(env.auths()[0].0, admin);
+        assert_eq!(
+            client.try_propose_admin(&admin),
+            Err(Ok(Error::AlreadyAdmin)),
+        );
+        // No proposal stored.
+        assert_eq!(client.pending_admin(), None);
     }
 
-    // ── Issue #218: instance TTL during read-heavy usage ─────────────────────
-
-    /// Demonstrates that `is_valid` / `get_lease` / `lease_status` /
-    /// `check_leases` extend persistent lease TTLs but do NOT touch the
-    /// instance TTL. `extend_instance_ttl` is the dedicated keeper call for
-    /// that purpose.
+    /// Re-proposing the already-pending address is rejected.
     #[test]
-    fn read_ops_extend_lease_ttl_but_not_instance_ttl() {
-        let env = Env::default();
-        env.mock_all_auths();
-        // Set a very short max_entry_ttl so we can observe TTL values clearly.
-        env.ledger().with_mut(|l| {
-            l.sequence_number = 0;
-            l.min_persistent_entry_ttl = 1000;
-            l.min_temp_entry_ttl = 1000;
-            l.max_entry_ttl = 200_000;
-        });
-        let id = env.register(AccessLease, ());
-        let client = AccessLeaseClient::new(&env, &id);
-        let admin = Address::generate(&env);
-        client.init(&admin);
-
-        let buyer = Address::generate(&env);
-        let rid = String::from_str(&env, "r");
-        client.grant_lease(&rid, &buyer, &1000u32);
-
-        // Record instance TTL after grant (bumped by require_admin).
-        let instance_ttl_after_grant = env.storage().instance().get_ttl();
-
-        // Advance and do many read operations.
-        advance(&env, 500);
-        for _ in 0..10 {
-            client.is_valid(&rid, &buyer);
-        }
-        for _ in 0..10 {
-            let _ = client.get_lease(&rid, &buyer);
-        }
-        for _ in 0..10 {
-            client.lease_status(&rid, &buyer);
-        }
-
-        // Persistent lease TTL is extended by reads.
-        let lease_ttl = env
-            .storage()
-            .persistent()
-            .get_ttl(&DataKey::Lease(rid.clone(), buyer.clone()));
-        assert!(lease_ttl > 0);
-
-        // Instance TTL has decreased (reads did not bump it).
-        let instance_ttl_after_reads = env.storage().instance().get_ttl();
-        assert!(
-            instance_ttl_after_reads < instance_ttl_after_grant,
-            "instance TTL should have decreased during read-only phase: before={}, after={}",
-            instance_ttl_after_grant,
-            instance_ttl_after_reads
-        );
-
-        // extend_instance_ttl restores the instance TTL without requiring admin.
-        client.extend_instance_ttl();
-        let instance_ttl_after_keeper = env.storage().instance().get_ttl();
-        assert!(
-            instance_ttl_after_keeper > instance_ttl_after_reads,
-            "extend_instance_ttl should raise instance TTL: before={}, after={}",
-            instance_ttl_after_reads,
-            instance_ttl_after_keeper
-        );
-    }
-
-    /// extend_instance_ttl requires no authorisation and can be called by anyone.
-    #[test]
-    fn extend_instance_ttl_requires_no_auth() {
+    fn propose_admin_same_pending_is_rejected() {
         let (env, client, _admin) = setup();
-        // No mock_auths beyond setup's mock_all_auths — just call it directly.
-        client.extend_instance_ttl();
-        // If it panicked on auth, the test would fail. Reaching here is enough.
+        let b = Address::generate(&env);
+
+        client.propose_admin(&b);
+        assert_eq!(
+            client.try_propose_admin(&b),
+            Err(Ok(Error::AlreadyPendingAdmin)),
+        );
+    }
+
+    /// A genuine replacement (A→B then A→C) succeeds and is observable.
+    #[test]
+    fn genuine_proposal_replacement_is_observable() {
+        let (env, client, _admin) = setup();
+        let b = Address::generate(&env);
+        let c = Address::generate(&env);
+
+        client.propose_admin(&b);
+        // Replacing B with C is allowed because C ≠ B.
+        client.propose_admin(&c);
+        assert_eq!(client.pending_admin(), Some(c.clone()));
+
+        // Verify the proposeadmin event topics for the replacement.
+        let all = env.events().all().filter_by_contract(&client.address);
+        let last = all.last_unchecked();
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = last.1;
+        let expected_topic: soroban_sdk::Val =
+            soroban_sdk::Symbol::new(&env, "proposeadmin").into_val(&env);
+        assert_eq!(topics.get_unchecked(0), expected_topic);
     }
 }
 #[cfg(test)]

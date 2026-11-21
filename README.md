@@ -174,81 +174,22 @@ stellar contract invoke --id <C_LEASE_ID> \
 ```
 PR / push to dev, main ──► fmt + clippy (-D warnings) + rustdoc (-D warnings)
                            tests (all contracts) + gas report
-                           WASM build (stellar contract build) + 64 KiB size check
-Merge to main          ──► build + deploy + init on Stellar testnet
-Manual dispatch        ──► mainnet deploy (confirmation + environment approval)
+                           WASM build + SHA-256 checksum manifest
+                           artifact upload (wasm + checksums.sha256)
 ```
 
-**GitHub secrets:**
+### Verifying downloaded WASM artifacts
 
-| Secret | Used by |
-|---|---|
-| `DEPLOYER_SECRET` | Testnet deploy (deploy is skipped if unset) |
-| `BACKEND_PUBLIC` | Testnet admin address passed to `init` |
-| `PUBLISHER1_PUBLIC`, `PUBLISHER2_PUBLIC` | Funded via friendbot on testnet |
-| `MAINNET_DEPLOYER_SECRET` | Mainnet deploy (`mainnet` environment) |
-| `MAINNET_ADMIN_PUBLIC` | Mainnet admin address passed to `init` |
+Every CI run uploads the three contract binaries (`vault_registry.wasm`, `access_lease.wasm`, `subscription.wasm`) together with a `checksums.sha256` manifest that ties each filename to the SHA-256 of its bytes. After downloading and extracting the artifact, verify it before deploying:
 
-## Architecture
-
-```
-Stellar Ledger
-│
-├── vault-registry     (C_REGISTRY_ID)
-│   └── Resource { id, creator, price, metadata, tags, listed }
-│
-├── access-lease       (C_LEASE_ID)
-│   └── Lease { resource_id, buyer, granted_at, expires_at, duration_ledgers }
-│
-└── subscription       (C_SUB_ID)
-    ├── Plan { plan_id, publisher, price_per_cycle, active }
-    └── Subscription { plan_id, subscriber, started_at, current_period_end, cancelled, total_renewals }
+```bash
+# From the directory containing the .wasm files and checksums.sha256
+sha256sum --check checksums.sha256
+# macOS (no sha256sum by default):
+# shasum -a 256 --check checksums.sha256
 ```
 
-## Storage TTLs
-
-Entries are TTL-bumped on every write so actively managed data is never archived:
-
-| Contract | Persistent bump |
-|---|---|
-| `vault-registry` | 30 days |
-| `access-lease` | 90 days |
-| `subscription` | 365 days |
-
-## Security
-
-- Every mutating call is gated by `require_auth()` on the appropriate authority.
-- `init` is one-time on every contract; the admin can only be changed by the current admin via `set_admin`.
-- The admin role is held by the backend's platform wallet — not a user wallet.
-- `is_valid` and `is_active` are fully permissionless — any frontend or smart contract can verify access without relying on SynapsVault's API.
-- All ledger-sequence arithmetic is checked; overflow returns an error instead of wrapping.
-- Every state change emits an event for off-chain indexing and auditing.
-- **Expiry boundary:** `expires_at` is **exclusive** across all three contracts. A lease or subscription is active while `expires_at > ledger.sequence()`; it is expired on the ledger whose sequence equals `expires_at`. See [`docs/CONTRACTS.md` → Common conventions](docs/CONTRACTS.md#common-conventions).
-
-### Access-control matrix
-
-Every mutating entrypoint and its required signer at a glance. The full matrix with corresponding test names lives in [`SECURITY_AUDIT.md` § 2](SECURITY_AUDIT.md#2-access-control-matrix-verified-by-tests).
-
-| Entrypoint | Required signer |
-|---|---|
-| `vault-registry::register` | `creator` |
-| `vault-registry::set_price` / `update_metadata` / `set_tags` | Stored creator |
-| `vault-registry::set_listed` / `delist` | Stored creator |
-| `vault-registry::propose_transfer` | Stored creator |
-| `vault-registry::accept_transfer` | Proposed new creator |
-| `vault-registry::cancel_transfer` | Stored creator |
-| `vault-registry::upgrade` / `migrate` | Admin |
-| `access-lease::grant_lease` / `extend_lease` / `revoke_lease` | Admin |
-| `access-lease::set_admin` / `propose_admin` / `accept_admin` | Current admin (or pending admin for `accept_admin`) |
-| `access-lease::upgrade` / `migrate` | Admin |
-| `subscription::subscribe` / `renew` | Admin |
-| `subscription::create_plan` / `deactivate_plan` / `transfer_plan` | Publisher |
-| `subscription::cancel` | Subscriber |
-| `subscription::set_admin` / `upgrade` / `migrate` | Admin |
-| `*::init` | None — see [SV-12](SECURITY_AUDIT.md#1-findings) |
-| All `get*` / `is_valid` / `is_active` / `list` reads | None (permissionless) |
-
-See [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) for findings and their status.
+A line reading `OK` per binary means the bytes match what CI built. Any `FAILED` line means the file was corrupted or tampered with — do not deploy it. To inspect a single hash:
 
 ## Repo siblings
 
@@ -279,3 +220,26 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-232 -->
 - #232: [subscription] Expose the billing cycle length through the contract interface
+
+<!-- handsoff-issue-191 -->
+- #191: [vault-registry] Stop full listing scans at the recorded resource count
+
+<!-- handsoff-issue-192 -->
+- #192: [vault-registry] Make registration counter exhaustion explicit
+
+<!-- handsoff-issue-193 -->
+- #193: [vault-registry] Offer bounded multi-resource reads
+
+<!-- handsoff-issue-194 -->
+- #194: [vault-registry] Add creator-filtered resource discovery
+<!-- handsoff-issue-187 -->
+- #187: [vault-registry] Normalize tag filters using the storage normalization rule
+
+<!-- handsoff-issue-188 -->
+- #188: [vault-registry] Add a pending ownership proposal getter
+
+<!-- handsoff-issue-189 -->
+- #189: [vault-registry] Add explicit expiry to ownership transfer proposals
+
+<!-- handsoff-issue-190 -->
+- #190: [vault-registry] Define a discovery-index retention policy

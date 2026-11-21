@@ -133,6 +133,9 @@ New codes added in this release:
 |---|---|
 | `BatchTooLarge` | 12 |
 | `NoPendingProposal` | 13 |
+| `AdminProposalExpired` | 14 |
+| `AlreadyAdmin` | 15 |
+| `AlreadyPendingAdmin` | 16 |
 
 Notes:
 
@@ -571,20 +574,22 @@ pub struct Lease {
     pub duration_ledgers: u32, // as originally requested
 }
 
-/// Returned by lease_status and check_leases.
-pub enum LeaseStatus {
-    Missing,      // no record (never granted or revoked)
-    Active(u32),  // remaining_ledgers = expires_at - ledger.sequence()
-    Expired,      // record exists but expires_at <= ledger.sequence()
+/// Stored in instance storage under DataKey::PendingAdmin.
+pub struct PendingAdminProposal {
+    pub pending_admin: Address, // nominee
+    pub deadline: u32,          // last ledger (inclusive) on which acceptance is valid
 }
 ```
 
 A lease is valid iff it exists and `expires_at > ledger.sequence()`.
 
+A pending admin proposal is accepted while `ledger.sequence() <= deadline`; after the deadline `accept_admin` returns `AdminProposalExpired` (#211).
+
 | Constant | Value |
 |---|---|
 | `MAX_RESOURCE_ID_LEN` | 64 bytes |
 | `MAX_BATCH_SIZE` | 50 |
+| `ADMIN_PROPOSAL_TTL_LEDGERS` | `30 * 17_280` (≈ 30 days) |
 
 ### Functions
 
@@ -593,10 +598,11 @@ A lease is valid iff it exists and `expires_at > ledger.sequence()`.
 | `init(admin)` | — (one-time) | `()` | `AlreadyInitialised` |
 | `admin()` | — | `Address` | `NotInitialised` |
 | `set_admin(new_admin)` | Admin | `()` | `NotInitialised` |
-| `propose_admin(pending_admin)` | Admin | `()` | `NotInitialised` |
-| `accept_admin(pending_admin)` | Pending admin | `()` | `NotInitialised`, `NoPendingAdmin`, `NotPendingAdmin` |
+| `propose_admin(pending_admin)` | Admin | `()` — no-op if `pending_admin` equals the current admin (`AlreadyAdmin`) or the already-pending admin (`AlreadyPendingAdmin`) (#213) | `NotInitialised`, `AlreadyAdmin`, `AlreadyPendingAdmin` |
+| `accept_admin(pending_admin)` | Pending admin | `()` | `NotInitialised`, `NoPendingAdmin`, `NotPendingAdmin`, `AdminProposalExpired` |
 | `cancel_admin_proposal()` | Admin | `()` | `NotInitialised`, `NoPendingProposal` |
 | `pending_admin()` | — | `Option<Address>` | — |
+| `pending_admin_proposal()` | — | `Option<PendingAdminProposal>` — includes the acceptance deadline (#211) | — |
 | `grant_lease(resource_id, buyer, duration_ledgers)` | Admin | `Lease` | `NotInitialised`, `InvalidDuration`, `AlreadyActive`, `InvalidResourceId` |
 | `grant_leases(requests)` | Admin | `Vec<Lease>` | `NotInitialised`, `InvalidDuration` (empty batch), `BatchTooLarge` (> `MAX_BATCH_SIZE`), `AlreadyActive`, `InvalidResourceId` |
 | `extend_lease(resource_id, buyer, extra_ledgers)` | Admin | `Lease` | `NotInitialised`, `InvalidDuration`, `LeaseNotFound` |
@@ -638,6 +644,36 @@ A lease is valid iff it exists and `expires_at > ledger.sequence()`.
 - `revoke_lease` deletes the record. After a revocation there is no prior-lease
   record to inherit `granted_at` from, so a subsequent `grant_lease` on the
   same `(resource_id, buyer)` pair sets a fresh `granted_at`.
+- **`propose_admin` guards (fixes #213):** `propose_admin` is a no-op (returns
+  an error) when the nominee is the current admin (`AlreadyAdmin`) or is already
+  the pending admin (`AlreadyPendingAdmin`). A genuine replacement (A→B, then
+  A→C) is still accepted and emits a `proposeadmin` event for C.
+- **Admin proposal deadline (fixes #211):** `propose_admin` stores a deadline
+  of `ledger.sequence() + ADMIN_PROPOSAL_TTL_LEDGERS` alongside the nominee.
+  `accept_admin` checks `ledger.sequence() <= deadline`; if the deadline has
+  passed it returns `AdminProposalExpired`. The deadline is exposed via the
+  permissionless `pending_admin_proposal()` read so clients can display the
+  expiry time.
+
+#### PendingAdmin storage layout change (migration note)
+
+The `PendingAdmin` instance-storage entry previously held a bare `Address`.
+It now holds a `PendingAdminProposal { pending_admin: Address, deadline: u32 }`.
+
+**Impact on existing deployments:** if a deployment has an outstanding pending
+admin proposal stored as a bare `Address` before this upgrade, `accept_admin`
+and `cancel_admin_proposal` will fail to decode the old entry and trap.
+**Migration procedure:**
+
+1. Before upgrading: either complete or cancel any outstanding proposal using
+   the old code.
+2. Upload the new WASM and call `upgrade` + `migrate`.
+3. Issue a fresh `propose_admin` if rotation was intended.
+
+If completing the old proposal before upgrade is not possible, call
+`set_admin(new_admin)` after the upgrade to bypass the broken proposal slot —
+`set_admin` removes `PendingAdmin` before writing the new admin, clearing the
+corrupt entry.
 
 - **`lease_status` (fixes #215)** returns a `LeaseStatus` enum with three
   variants:
@@ -705,6 +741,7 @@ the recommended cadence. The call is idempotent and cheap.
 |---|---|---|---|
 | `Admin` | instance | `Address` | instance bumped to 90 days on admin calls |
 | `Version` | instance | `String` | — |
+| `PendingAdmin` | instance | `PendingAdminProposal { pending_admin: Address, deadline: u32 }` | — (cleared on accept or cancel) |
 | `Lease(resource_id, buyer)` | persistent | `Lease` | bumped to 90 days on write |
 
 ### Events
@@ -741,6 +778,9 @@ for how they compare with the other contracts.
 | 11 | `NotPendingAdmin` | Address is not the proposed admin. |
 | 12 | `BatchTooLarge` | `grant_leases` received more than `MAX_BATCH_SIZE` (50) requests. |
 | 13 | `NoPendingProposal` | `cancel_admin_proposal` called with no pending proposal. |
+| 14 | `AdminProposalExpired` | `accept_admin` called after the proposal deadline has passed (`ledger.sequence() > deadline`). |
+| 15 | `AlreadyAdmin` | `propose_admin` called with an address that is already the current admin. |
+| 16 | `AlreadyPendingAdmin` | `propose_admin` called with an address that is already the pending admin (re-nomination). |
 
 ---
 

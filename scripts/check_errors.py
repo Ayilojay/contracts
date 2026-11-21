@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Check each contract's public error discriminants against its own docs table."""
+"""Check each contract's public error discriminants against its own docs table.
+
+Also validates the deployment manifest (deployed/contract-ids.env) so that
+missing or malformed contract IDs, versions, network, and timestamp fields
+are rejected before the workflow commits the file.
+"""
 from pathlib import Path
 import re
 import sys
@@ -9,6 +14,14 @@ CONTRACTS = ("vault-registry", "access-lease", "subscription")
 ENUM = re.compile(r"#\[contracterror\][\s\S]*?\benum\s+Error\s*\{([^}]*)\}")
 VARIANT = re.compile(r"^\s*(\w+)\s*=\s*(\d+)\s*,", re.MULTILINE)
 ROW = re.compile(r"^\|\s*(\d+)\s*\|\s*`(\w+)`\s*\|", re.MULTILINE)
+
+MANIFEST = ROOT / "deployed" / "contract-ids.env"
+REQUIRED_IDS = ("VAULT_REGISTRY_ID", "ACCESS_LEASE_ID", "SUBSCRIPTION_ID")
+REQUIRED_FIELDS = REQUIRED_IDS + ("NETWORK", "VERSION", "TIMESTAMP")
+CONTRACT_ID = re.compile(r"^C[A-Z2-7]{55}$")
+NETWORK = re.compile(r"^(testnet|mainnet|futurenet)$")
+VERSION = re.compile(r"^\d+\.\d+\.\d+$")
+TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
 def check_error_tables() -> list[str]:
@@ -35,10 +48,48 @@ def check_error_tables() -> list[str]:
     return errors
 
 
+def check_deployment_manifest() -> list[str]:
+    if not MANIFEST.is_file():
+        return [f"manifest: missing {MANIFEST.relative_to(ROOT)}"]
+    values: dict[str, str] = {}
+    errors = []
+    for lineno, raw in enumerate(MANIFEST.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            errors.append(f"manifest: line {lineno}: expected KEY=VALUE, got {line!r}")
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        if key in values:
+            errors.append(f"manifest: line {lineno}: duplicate key {key}")
+        values[key] = value
+    for key in REQUIRED_FIELDS:
+        if key not in values:
+            errors.append(f"manifest: missing required field {key}")
+        elif not values[key]:
+            errors.append(f"manifest: empty value for {key}")
+    for key in REQUIRED_IDS:
+        value = values.get(key, "")
+        if value and not CONTRACT_ID.match(value):
+            errors.append(f"manifest: {key}: malformed contract ID {value!r}")
+    network = values.get("NETWORK", "")
+    if network and not NETWORK.match(network):
+        errors.append(f"manifest: NETWORK: unsupported value {network!r}")
+    version = values.get("VERSION", "")
+    if version and not VERSION.match(version):
+        errors.append(f"manifest: VERSION: malformed semver {version!r}")
+    timestamp = values.get("TIMESTAMP", "")
+    if timestamp and not TIMESTAMP.match(timestamp):
+        errors.append(f"manifest: TIMESTAMP: malformed ISO-8601 UTC {timestamp!r}")
+    return errors
+
+
 if __name__ == "__main__":
-    issues = check_error_tables()
+    issues = check_error_tables() + check_deployment_manifest()
     for issue in issues:
         print(issue, file=sys.stderr)
     if not issues:
         print("All contract error-code tables match their Rust enums.")
+        print("Deployment manifest fields are present and well-formed.")
     sys.exit(bool(issues))
