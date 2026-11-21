@@ -142,6 +142,41 @@ jobs:
           echo "Restored checkpoint from run $RESUME_RUN_ID:"
           cat deployed/checkpoints/*.env 2>/dev/null || true
 
+      - name: Validate checkpoint (resume)
+        if: ${{ github.event.inputs.resume_run_id != '' }}
+        run: |
+          set -euo pipefail
+          # A checkpoint is only trusted if every entry is well-formed and
+          # references a contract ID that actually exists on-chain. Anything
+          # malformed or stale is rejected so we never resume onto a bad ID.
+          shopt -s nullglob
+          CHECKPOINTS=(deployed/checkpoints/*.env)
+          if [ "${#CHECKPOINTS[@]}" -eq 0 ]; then
+            echo "::error::Resume requested but no checkpoint files were restored."
+            exit 1
+          fi
+          for CHECKPOINT in "${CHECKPOINTS[@]}"; do
+            CONTRACT_ID=""
+            PACKAGE=""
+            # shellcheck disable=SC1090
+            . "$CHECKPOINT"
+            if [ -z "${PACKAGE:-}" ] || [ -z "${CONTRACT_ID:-}" ]; then
+              echo "::error::Checkpoint $CHECKPOINT is missing PACKAGE or CONTRACT_ID."
+              exit 1
+            fi
+            if ! printf '%s' "$CONTRACT_ID" | grep -Eq '^C[A-Z2-7]{55}$'; then
+              echo "::error::Checkpoint $CHECKPOINT has malformed CONTRACT_ID '$CONTRACT_ID'."
+              exit 1
+            fi
+            if ! stellar contract info interface \
+                --id "$CONTRACT_ID" \
+                --network "$NETWORK" >/dev/null 2>&1; then
+              echo "::error::Checkpoint $CHECKPOINT references $CONTRACT_ID which is not deployed on-chain."
+              exit 1
+            fi
+            echo "::notice::Checkpoint $CHECKPOINT validated (${PACKAGE}=${CONTRACT_ID})"
+          done
+
       - name: Verify required accounts exist
         run: |
           set -euo pipefail
@@ -171,14 +206,39 @@ jobs:
           for PKG in vault_registry access_lease subscription; do
             VAR=$(echo "$PKG" | tr '[:lower:]' '[:upper:]')
             CHECKPOINT="deployed/checkpoints/${PKG}.env"
+            CONTRACT_ID=""
+            DEPLOY_STATUS=""
             if [ -f "$CHECKPOINT" ]; then
               # shellcheck disable=SC1090
               . "$CHECKPOINT"
-              if [ -n "${CONTRACT_ID:-}" ]; then
+            fi
+            if [ -n "${CONTRACT_ID:-}" ]; then
+              # Read back the existing deployment before reuse: the ID must
+              # still resolve on-chain, otherwise we fall through to redeploy.
+              if stellar contract info interface \
+                  --id "$CONTRACT_ID" \
+                  --network "$NETWORK" >/dev/null 2>&1; then
                 echo "::notice::Resuming ${PKG}; reusing existing ID ${CONTRACT_ID}"
                 echo "${VAR}=${CONTRACT_ID}" >> "$GITHUB_ENV"
+                if [ "${DEPLOY_STATUS:-}" = "initialized" ]; then
+                  echo "::notice::${PKG} already initialized; skipping init"
+                  continue
+                fi
+                # Deployed but not initialized: resume at the init step only.
+                stellar contract invoke \
+                  --id "$CONTRACT_ID" \
+                  --source-account "$DEPLOYER_SECRET" \
+                  --network "$NETWORK" \
+                  -- init --admin "$ADMIN_PUBLIC"
+                {
+                  echo "CONTRACT_ID=${CONTRACT_ID}"
+                  echo "PACKAGE=${PKG}"
+                  echo "DEPLOY_STATUS=initialized"
+                  echo "DEPLOYED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                } > "$CHECKPOINT"
                 continue
               fi
+              echo "::warning::Checkpoint ID ${CONTRACT_ID} for ${PKG} not found on-chain; redeploying"
             fi
             ID=$(stellar contract deploy \
               --wasm "target/wasm32v1-none/release/${PKG}.wasm" \
@@ -196,6 +256,12 @@ jobs:
               --source-account "$DEPLOYER_SECRET" \
               --network "$NETWORK" \
               -- init --admin "$ADMIN_PUBLIC"
+            {
+              echo "CONTRACT_ID=${ID}"
+              echo "PACKAGE=${PKG}"
+              echo "DEPLOY_STATUS=initialized"
+              echo "DEPLOYED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            } > "$CHECKPOINT"
             # Post-init readback: verify on-chain admin and stored version match intent.
             EXPECTED_VERSION=$(cargo metadata --no-deps --format-version 1 \
               | jq -r --arg pkg "$(echo "$PKG" | tr '_' '-')" '.packages[] | select(.name == $pkg) | .version')
@@ -215,6 +281,40 @@ jobs:
             fi
             if [ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]; then
               echo "::error::${PKG} version mismatch: expected '$EXPECTED_VERSION', got '$ACTUAL_VERSION'"
+              exit 1
+            fi
+            echo "::notice::${PKG} verified (admin + version)"
+          done
+
+      - name: Write deployed contract IDs
+        run: |
+          set -euo pipefail
+          mkdir -p deployed
+          : > deployed/contract-ids.env
+          for PKG in vault_registry access_lease subscription; do
+            VAR=$(echo "$PKG" | tr '[:lower:]' '[:upper:]')
+            CHECKPOINT="deployed/checkpoints/${PKG}.env"
+            CONTRACT_ID=""
+            if [ -f "$CHECKPOINT" ]; then
+              # shellcheck disable=SC1090
+              . "$CHECKPOINT"
+            fi
+            if [ -z "${CONTRACT_ID:-}" ]; then
+              echo "::error::No contract ID recorded for ${PKG}"
+              exit 1
+            fi
+            echo "${VAR}=${CONTRACT_ID}" >> deployed/contract-ids.env
+          done
+          cat deployed/contract-ids.env
+
+      - name: Upload checkpoint artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mainnet-deploy-checkpoint
+          path: deployed/checkpoints/*.env
+          if-no-files-found: warn
+          retention-days: 30
               exit 1
             fi
             echo "::notice::${PKG} verified (admin + version ${EXPECTED_VERSION})"
