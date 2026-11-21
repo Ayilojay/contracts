@@ -30,6 +30,10 @@ const BUMP_THRESH: u32 = PERSISTENT_TTL_THRESHOLD;
 /// Maximum accepted length (in bytes) of a `resource_id`.
 pub const MAX_RESOURCE_ID_LEN: u32 = 64;
 
+/// Maximum number of entries accepted by [`grant_leases`], [`check_leases`],
+/// and [`revoke_leases`] in a single call.
+pub const MAX_BATCH_SIZE: u32 = 50;
+
 /// Maximum accepted lease duration in ledgers.
 ///
 /// The contract enforces no upper bound on duration beyond the natural `u32`
@@ -494,6 +498,148 @@ impl AccessLease {
         env.storage().persistent().remove(&key);
         RevokeEvent { resource_id, buyer }.publish(&env);
         Ok(())
+    }
+
+    /// Revoke leases for multiple `(resource_id, buyer)` pairs in a single
+    /// admin-authorised call.
+    ///
+    /// **Batch size:** accepts 1 to [`MAX_BATCH_SIZE`] entries (inclusive).
+    /// An empty vector is rejected with [`Error::InvalidDuration`]. A vector
+    /// exceeding [`MAX_BATCH_SIZE`] is rejected with [`Error::BatchTooLarge`].
+    /// Both size checks happen before any storage write.
+    ///
+    /// **Missing records:** a pair that has no lease record is silently skipped
+    /// (no error, no event). This matches the least-surprise expectation for
+    /// bulk operations where some pairs may already have been revoked or were
+    /// never granted.
+    ///
+    /// **Duplicates:** if the same `(resource_id, buyer)` pair appears more
+    /// than once, the first occurrence removes the record and subsequent
+    /// occurrences are silently skipped (the entry is already absent).
+    ///
+    /// **Atomicity:** all storage writes and all events are applied together.
+    /// Because missing/duplicate entries are skipped rather than erroring, the
+    /// only failure modes are the size-cap errors above, which occur before any
+    /// write.
+    pub fn revoke_leases(
+        env: Env,
+        pairs: soroban_sdk::Vec<(String, Address)>,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+
+        if pairs.is_empty() {
+            return Err(Error::InvalidDuration);
+        }
+        if pairs.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
+        for pair in pairs.iter() {
+            let key = DataKey::Lease(pair.0.clone(), pair.1.clone());
+            if env.storage().persistent().has(&key) {
+                env.storage().persistent().remove(&key);
+                RevokeEvent {
+                    resource_id: pair.0,
+                    buyer: pair.1,
+                }
+                .publish(&env);
+            }
+        }
+        Ok(())
+    }
+
+    /// Return a structured [`LeaseStatus`] for the given `(resource_id, buyer)` pair.
+    ///
+    /// Unlike [`is_valid`] (boolean) or [`get_lease`] (full record or error),
+    /// this helper gives callers a single call that distinguishes three states:
+    ///
+    /// - `LeaseStatus::Missing`  — no record (never granted, or revoked).
+    /// - `LeaseStatus::Active(remaining)` — lease is live; `remaining` is the
+    ///   number of ledgers until expiry (`expires_at - ledger.sequence()`).
+    /// - `LeaseStatus::Expired`  — record exists but already past `expires_at`.
+    ///
+    /// When a record is found (Active or Expired) the persistent-entry TTL is
+    /// extended, matching the behaviour of [`is_valid`] and [`get_lease`].
+    ///
+    /// **Expiry boundary:** a lease with `expires_at == ledger.sequence()` is
+    /// `Expired`, not `Active`. Validity is strict: `expires_at` is exclusive.
+    pub fn lease_status(env: Env, resource_id: String, buyer: Address) -> LeaseStatus {
+        let key = DataKey::Lease(resource_id, buyer);
+        match env.storage().persistent().get::<_, Lease>(&key) {
+            None => LeaseStatus::Missing,
+            Some(lease) => {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL);
+                let now = env.ledger().sequence();
+                if lease.expires_at > now {
+                    LeaseStatus::Active(lease.expires_at - now)
+                } else {
+                    LeaseStatus::Expired
+                }
+            }
+        }
+    }
+
+    /// Return the [`LeaseStatus`] for each `(resource_id, buyer)` pair in
+    /// `queries`, in the same order as the input.
+    ///
+    /// **Batch size:** accepts 1 to [`MAX_BATCH_SIZE`] queries (inclusive).
+    /// An empty vector is rejected with [`Error::InvalidDuration`]. A vector
+    /// exceeding [`MAX_BATCH_SIZE`] is rejected with [`Error::BatchTooLarge`].
+    ///
+    /// **Missing records:** a pair with no lease returns `LeaseStatus::Missing`
+    /// at its position in the output — it is not an error.
+    ///
+    /// **Ordering:** the output `Vec<LeaseStatus>` is index-aligned with the
+    /// input `queries` vec: `result[i]` corresponds to `queries[i]`.
+    ///
+    /// **Cap rationale:** at 50 entries × ~2 storage reads each, the worst-case
+    /// ledger-entry budget is well within the Soroban per-transaction limit.
+    /// Increasing the cap beyond [`MAX_BATCH_SIZE`] is a network-parameter
+    /// decision; callers with larger sets should paginate.
+    pub fn check_leases(
+        env: Env,
+        queries: soroban_sdk::Vec<(String, Address)>,
+    ) -> Result<soroban_sdk::Vec<LeaseStatus>, Error> {
+        if queries.is_empty() {
+            return Err(Error::InvalidDuration);
+        }
+        if queries.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
+        let mut results = soroban_sdk::Vec::new(&env);
+        for q in queries.iter() {
+            results.push_back(Self::lease_status(env.clone(), q.0, q.1));
+        }
+        Ok(results)
+    }
+
+    /// Extend the instance-storage TTL without performing any other operation.
+    ///
+    /// Instance storage holds the admin address and version string. Its TTL is
+    /// normally bumped as a side-effect of every admin-gated write call.
+    /// During sustained read-heavy usage (many `is_valid` / `get_lease` /
+    /// `lease_status` / `check_leases` calls with no writes) the instance entry
+    /// is **not** touched, so its TTL drifts down.
+    ///
+    /// **Who should call this:** an off-chain keeper process (cron job, bot)
+    /// should call `extend_instance_ttl` periodically — for example once per
+    /// day — whenever the contract is operating in a read-only phase. The call
+    /// requires no authorisation and costs only a single instance-storage read
+    /// and bump; it is safe to call as often as desired.
+    ///
+    /// **Why this is needed:** `is_valid`, `get_lease`, `lease_status`, and
+    /// `check_leases` only extend *persistent* lease-entry TTLs, not the
+    /// instance TTL. If the instance entry archives, every subsequent call —
+    /// including reads — will fail with a host-level trap until the instance is
+    /// restored.
+    ///
+    /// See `docs/CONTRACTS.md § access-lease Instance TTL maintenance` for the
+    /// full maintenance model.
+    pub fn extend_instance_ttl(env: Env) {
+        env.storage().instance().extend_ttl(BUMP_THRESH, BUMP);
     }
 
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
