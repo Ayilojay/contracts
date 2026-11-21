@@ -20,6 +20,7 @@ jobs:
   confirm:
     name: Confirmation Gate
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Verify confirmation input
         env:
@@ -36,6 +37,8 @@ jobs:
     needs: confirm
     runs-on: ubuntu-latest
     environment: mainnet
+    # 30 minutes covers toolchain install, full workspace test/build, and
+    # on-chain deploy + init of all three contracts against mainnet RPC.
     timeout-minutes: 30
     env:
       NETWORK: mainnet
@@ -70,9 +73,11 @@ jobs:
           stellar --version
 
       - name: Test contracts
+        timeout-minutes: 15
         run: cargo test --locked --workspace
 
       - name: Build contracts
+        timeout-minutes: 10
         run: |
           stellar contract build --locked
           ls -lh target/wasm32v1-none/release/*.wasm
