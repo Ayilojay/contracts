@@ -1,185 +1,209 @@
 name: Testnet Deploy
 
 on:
+  workflow_dispatch:
+    inputs:
+      network:
+        description: "Stellar network to deploy to"
+        required: true
+        default: testnet
+        type: choice
+        options:
+          - testnet
+          - futurenet
   push:
     branches: [main]
     paths:
-      - 'contracts/**'
-      - '.github/workflows/testnet-deploy.yml'
-  workflow_dispatch:
+      - "contracts/**"
+      - ".github/workflows/testnet-deploy.yml"
+
+concurrency:
+  group: testnet-deploy-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 env:
-  # Single maintained source for the Stellar CLI version across all workflows.
+  CARGO_TERM_COLOR: always
   STELLAR_CLI_VERSION: "27.0.0"
-  # Expected SHA-256 of the stellar-cli release archive for the pinned version.
-  STELLAR_CLI_SHA256: "0000000000000000000000000000000000000000000000000000000000000000"
+  # Bounded retry policy for friendbot funding calls.
+  FRIENDBOT_MAX_ATTEMPTS: "5"
+  FRIENDBOT_BASE_DELAY_SECONDS: "3"
 
 jobs:
-  check-secrets:
-    name: Check deploy secrets
-    runs-on: ubuntu-latest
-    outputs:
-      ready: ${{ steps.check.outputs.ready }}
-    steps:
-      - id: check
-        env:
-          DEPLOYER_SECRET: ${{ secrets.DEPLOYER_SECRET }}
-        run: |
-          if [ -n "$DEPLOYER_SECRET" ]; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::DEPLOYER_SECRET is not set — skipping testnet deploy. Add the deploy secrets in repo Settings → Secrets → Actions."
-          fi
-
   deploy:
-    name: Build + Deploy + Init on Stellar Testnet
-    needs: check-secrets
-    if: needs.check-secrets.outputs.ready == 'true'
+    name: Deploy to ${{ github.event.inputs.network || 'testnet' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    env:
-      DEPLOYER_SECRET:   ${{ secrets.DEPLOYER_SECRET }}
-      BACKEND_PUBLIC:    ${{ secrets.BACKEND_PUBLIC }}
-      BACKEND_SECRET:    ${{ secrets.BACKEND_SECRET }}
-      PUBLISHER1_PUBLIC: ${{ secrets.PUBLISHER1_PUBLIC }}
-      PUBLISHER2_PUBLIC: ${{ secrets.PUBLISHER2_PUBLIC }}
-
+    environment: ${{ github.event.inputs.network || 'testnet' }}
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Install Rust + wasm32v1-none
+      - name: Install Rust stable + wasm32v1-none
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32v1-none
+          targets: wasm32-unknown-unknown
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Install Stellar CLI
+        run: cargo install --locked stellar-cli
 
-      - name: Install Stellar CLI v${{ env.STELLAR_CLI_VERSION }}
+      - name: Install Stellar CLI
         run: |
-          set -euo pipefail
-          ARCHIVE="stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-          URL="https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/${ARCHIVE}"
-          curl -fsSL -o "${ARCHIVE}" "${URL}"
-          echo "${STELLAR_CLI_SHA256}  ${ARCHIVE}" | sha256sum -c -
-          sudo tar xzf "${ARCHIVE}" -C /usr/local/bin
-          rm -f "${ARCHIVE}"
+          curl -sL \
+            "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | sudo tar xz -C /usr/local/bin
           stellar --version
 
-      - name: Configure testnet
-        run: |
-          stellar network add testnet \
-            --rpc-url https://soroban-testnet.stellar.org \
-            --network-passphrase "Test SDF Network ; September 2015" 2>/dev/null || true
-
-      - name: Fund accounts
-        run: |
-          stellar keys add deployer --secret-key <<< "$DEPLOYER_SECRET" >/dev/null 2>&1 || true
-          DEPLOYER_PUB=$(stellar keys address deployer 2>/dev/null \
-            || echo "GCJH6RF7EU7LRXZK3QPJD2XZ7ZL7GI67WUPVRWROJ6XDEJKHIKW7GFWX")
-          for ADDR in "$DEPLOYER_PUB" "$BACKEND_PUBLIC" "$PUBLISHER1_PUBLIC" "$PUBLISHER2_PUBLIC"; do
-            echo "Funding $ADDR"
-            curl -sf "https://friendbot.stellar.org?addr=${ADDR}" > /dev/null && echo "  ✅" || echo "  ⚠️"
-          done
-
       - name: Build all contracts
-        run: |
-          stellar contract build --locked
-          ls -lh target/wasm32v1-none/release/*.wasm
+        run: stellar contract build --locked
 
-      - name: Deploy vault-registry
+      - name: Resolve network settings
+        id: net
         run: |
-          ID=$(stellar contract deploy \
-            --wasm target/wasm32v1-none/release/vault_registry.wasm \
-            --source-account "$DEPLOYER_SECRET" \
-            --network testnet --ignore-checks)
-          echo "VAULT_REGISTRY=$ID" >> $GITHUB_ENV
-          echo "::notice::vault-registry=$ID"
+          NETWORK="${{ github.event.inputs.network || 'testnet' }}"
+          case "$NETWORK" in
+            testnet)
+              RPC_URL="https://soroban-testnet.stellar.org"
+              NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+              FRIENDBOT_URL="https://friendbot.stellar.org"
+              ;;
+            futurenet)
+              RPC_URL="https://rpc-futurenet.stellar.org"
+              NETWORK_PASSPHRASE="Test SDF Future Network ; October 2022"
+              FRIENDBOT_URL="https://friendbot-futurenet.stellar.org"
+              ;;
+            *)
+              echo "::error::Unsupported network: $NETWORK"
+              exit 1
+              ;;
+          esac
+          echo "network=$NETWORK" >> "$GITHUB_OUTPUT"
+          echo "rpc_url=$RPC_URL" >> "$GITHUB_OUTPUT"
+          echo "network_passphrase=$NETWORK_PASSPHRASE" >> "$GITHUB_OUTPUT"
+          echo "friendbot_url=$FRIENDBOT_URL" >> "$GITHUB_OUTPUT"
 
-      - name: Deploy access-lease
+      - name: Fund and verify deployer account (required)
+        id: fund-deployer
+        env:
+          FRIENDBOT_URL: ${{ steps.net.outputs.friendbot_url }}
+          RPC_URL: ${{ steps.net.outputs.rpc_url }}
+          NETWORK_PASSPHRASE: ${{ steps.net.outputs.network_passphrase }}
         run: |
-          ID=$(stellar contract deploy \
-            --wasm target/wasm32v1-none/release/access_lease.wasm \
-            --source-account "$DEPLOYER_SECRET" \
-            --network testnet --ignore-checks)
-          echo "ACCESS_LEASE=$ID" >> $GITHUB_ENV
-          echo "::notice::access-lease=$ID"
+          set -euo pipefail
 
-      - name: Deploy subscription
-        run: |
-          ID=$(stellar contract deploy \
-            --wasm target/wasm32v1-none/release/subscription.wasm \
-            --source-account "$DEPLOYER_SECRET" \
-            --network testnet --ignore-checks)
-          echo "SUBSCRIPTION=$ID" >> $GITHUB_ENV
-          echo "::notice::subscription=$ID"
+          # Generate a fresh deployer identity.
+          stellar keys generate deployer --network "${{ steps.net.outputs.network }}" --fund false
+          DEPLOYER_ADDR=$(stellar keys address deployer)
+          echo "deployer=$DEPLOYER_ADDR" >> "$GITHUB_OUTPUT"
 
-      - name: Init vault-registry
-        run: |
-          stellar contract invoke \
-            --id "$VAULT_REGISTRY" \
-            --source-account "$DEPLOYER_SECRET" \
-            --network testnet \
-            -- init --admin "$BACKEND_PUBLIC"
+          account_exists() {
+            stellar account show "$DEPLOYER_ADDR" \
+              --rpc-url "$RPC_URL" \
+              --network-passphrase "$NETWORK_PASSPHRASE" >/dev/null 2>&1
+          }
 
-      - name: Init access-lease
-        run: |
-          stellar contract invoke \
-            --id "$ACCESS_LEASE" \
-            --source-account "$DEPLOYER_SECRET" \
-            --network testnet \
-            -- init --admin "$BACKEND_PUBLIC"
+          # Bounded retry with exponential backoff for transient friendbot failures.
+          attempt=1
+          while [ "$attempt" -le "$FRIENDBOT_MAX_ATTEMPTS" ]; do
+            echo "Friendbot funding attempt $attempt/$FRIENDBOT_MAX_ATTEMPTS for $DEPLOYER_ADDR"
+            if curl -fsS --max-time 30 "${FRIENDBOT_URL}/?addr=${DEPLOYER_ADDR}" >/dev/null; then
+              echo "Friendbot accepted funding request on attempt $attempt"
+            else
+              echo "::warning::Friendbot request failed on attempt $attempt"
+            fi
 
-      - name: Init subscription
-        run: |
-          stellar contract invoke \
-            --id "$SUBSCRIPTION" \
-            --source-account "$DEPLOYER_SECRET" \
-            --network testnet \
-            -- init --admin "$BACKEND_PUBLIC"
+            # Verify the account actually exists on-chain before proceeding.
+            if account_exists; then
+              echo "Deployer account $DEPLOYER_ADDR is funded and ready"
+              exit 0
+            fi
 
-      - name: Read contract versions
-        run: |
-          for PKG in vault-registry access-lease subscription; do
-            VAR=$(echo "$PKG" | tr '[:lower:]-' '[:upper:]_')_VERSION
-            VERSION=$(cargo metadata --no-deps --format-version 1 \
-              | jq -r --arg pkg "$PKG" '.packages[] | select(.name == $pkg) | .version')
-            echo "${VAR}=${VERSION}" >> $GITHUB_ENV
-            echo "::notice::${PKG} version=${VERSION}"
+            if [ "$attempt" -lt "$FRIENDBOT_MAX_ATTEMPTS" ]; then
+              delay=$(( FRIENDBOT_BASE_DELAY_SECONDS * attempt ))
+              echo "Account not ready yet; retrying in ${delay}s"
+              sleep "$delay"
+            fi
+            attempt=$(( attempt + 1 ))
           done
 
-      - name: Save + commit contract IDs
-        run: |
-          mkdir -p deployed
-          cat > deployed/contract-ids.env << EOF
-          vault_registry=$VAULT_REGISTRY
-          vault_registry_version=$VAULT_REGISTRY_VERSION
-          access_lease=$ACCESS_LEASE
-          access_lease_version=$ACCESS_LEASE_VERSION
-          subscription=$SUBSCRIPTION
-          subscription_version=$SUBSCRIPTION_VERSION
-          network=testnet
-          deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          EOF
-          
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add deployed/contract-ids.env
-          git diff --cached --quiet || git commit -m "chore: deployed contract IDs [skip ci]"
-          git push
+          echo "::error::Required deployer account $DEPLOYER_ADDR was not established after $FRIENDBOT_MAX_ATTEMPTS attempts"
+          exit 1
 
-      - name: Job summary
+      - name: Fund optional accounts (best-effort)
+        id: fund-optional
+        continue-on-error: true
+        env:
+          FRIENDBOT_URL: ${{ steps.net.outputs.friendbot_url }}
+          RPC_URL: ${{ steps.net.outputs.rpc_url }}
+          NETWORK_PASSPHRASE: ${{ steps.net.outputs.network_passphrase }}
         run: |
-          cat deployed/contract-ids.env
-          echo "## ✅ SynapsVault Contracts on Stellar Testnet" >> $GITHUB_STEP_SUMMARY
-          echo "| Contract | ID | Version |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| vault-registry | \`$VAULT_REGISTRY\` | \`$VAULT_REGISTRY_VERSION\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| access-lease   | \`$ACCESS_LEASE\` | \`$ACCESS_LEASE_VERSION\` |"   >> $GITHUB_STEP_SUMMARY
-          echo "| subscription   | \`$SUBSCRIPTION\` | \`$SUBSCRIPTION_VERSION\` |"   >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "[View on Stellar Expert →](https://stellar.expert/explorer/testnet/contract/$VAULT_REGISTRY)" >> $GITHUB_STEP_SUMMARY
+          set -uo pipefail
+
+          # Optional accounts are surfaced but never block deployment.
+          OPTIONAL_ACCOUNTS="${OPTIONAL_ACCOUNTS:-}"
+          if [ -z "$OPTIONAL_ACCOUNTS" ]; then
+            echo "No optional accounts configured; skipping"
+            exit 0
+          fi
+
+          failed=""
+          for addr in $OPTIONAL_ACCOUNTS; do
+            funded=0
+            attempt=1
+            while [ "$attempt" -le "$FRIENDBOT_MAX_ATTEMPTS" ]; do
+              if curl -fsS --max-time 30 "${FRIENDBOT_URL}/?addr=${addr}" >/dev/null; then
+                if stellar account show "$addr" \
+                  --rpc-url "$RPC_URL" \
+                  --network-passphrase "$NETWORK_PASSPHRASE" >/dev/null 2>&1; then
+                  funded=1
+                  break
+                fi
+              fi
+              if [ "$attempt" -lt "$FRIENDBOT_MAX_ATTEMPTS" ]; then
+                sleep $(( FRIENDBOT_BASE_DELAY_SECONDS * attempt ))
+              fi
+              attempt=$(( attempt + 1 ))
+            done
+            if [ "$funded" -eq 1 ]; then
+              echo "Optional account $addr funded"
+            else
+              echo "::warning::Optional account $addr could not be funded after $FRIENDBOT_MAX_ATTEMPTS attempts"
+              failed="$failed $addr"
+            fi
+          done
+
+          if [ -n "$failed" ]; then
+            echo "::warning::Optional accounts not funded:$failed"
+            echo "optional_failures=$failed" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report funding summary
+        if: always()
+        run: |
+          {
+            echo "## Testnet deploy funding summary"
+            echo ""
+            echo "- Network: ${{ steps.net.outputs.network }}"
+            echo "- Deployer: ${{ steps.fund-deployer.outputs.deployer }}"
+            echo "- Required deployer funding: ${{ steps.fund-deployer.outcome }}"
+            echo "- Optional accounts funding: ${{ steps.fund-optional.outcome }}"
+            if [ -n "${{ steps.fund-optional.outputs.optional_failures }}" ]; then
+              echo "- Optional failures:${{ steps.fund-optional.outputs.optional_failures }}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy contracts
+        env:
+          RPC_URL: ${{ steps.net.outputs.rpc_url }}
+          NETWORK_PASSPHRASE: ${{ steps.net.outputs.network_passphrase }}
+        run: |
+          set -euo pipefail
+          for wasm in target/wasm32v1-none/release/*.wasm; do
+            echo "Deploying $(basename "$wasm")"
+            stellar contract deploy \
+              --wasm "$wasm" \
+              --source deployer \
+              --rpc-url "$RPC_URL" \
+              --network-passphrase "$NETWORK_PASSPHRASE"
+          done

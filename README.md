@@ -191,8 +191,55 @@ sha256sum --check checksums.sha256
 
 A line reading `OK` per binary means the bytes match what CI built. Any `FAILED` line means the file was corrupted or tampered with — do not deploy it. To inspect a single hash:
 
-```bash
-sha256sum access_lease.wasm
-# or compare against the manifest entry:
-grep access_lease.wasm checksums.sha256
-```
+## Repo siblings
+
+| Repo | Description |
+|---|---|
+| `SynapsVault-frontend` | React UI |
+| `SynapsVault-backend` | Express API |
+
+## License
+
+MIT © 2025 Busiii-adetiba
+
+## Handoff notes
+
+- #42: `[access-lease]` `set_admin` is single-step; a mistyped address permanently locks admin — propose two-step rotation
+- #44: `[access-lease]` `is_compatible` uses exact string match here but major/minor match in `vault-registry` — unify semantics
+- #50: `[subscription]` Publishers cannot change a plan's price after creation
+- #51: `[subscription]` Plan ownership cannot be transferred (`vault-registry` supports this)
+- #53: `[subscription]` Resubscribing a cancelled-but-paid subscription adds a full cycle on top of the remaining time; confirm thi...
+
+## Handsoff notes
+
+<!-- handsoff-issue-106 -->
+- #106: [cross-cutting] Gas budget test covers only register, set_price, get and list in vault-registry; add budgets for lease and...
+
+<!-- handsoff-issue-116 -->
+- #116: [docs and tooling] Doc comments on Lease, Subscription and Plan use "30-day" and "ledgers" interchangeably; state the conversi...
+
+<!-- handsoff-issue-232 -->
+- #232: [subscription] Expose the billing cycle length through the contract interface
+
+<!-- handsoff-issue-191 -->
+- #191: [vault-registry] Stop full listing scans at the recorded resource count
+
+<!-- handsoff-issue-192 -->
+- #192: [vault-registry] Make registration counter exhaustion explicit
+
+<!-- handsoff-issue-193 -->
+- #193: [vault-registry] Offer bounded multi-resource reads
+
+<!-- handsoff-issue-194 -->
+- #194: [vault-registry] Add creator-filtered resource discovery
+<!-- handsoff-issue-187 -->
+- #187: [vault-registry] Normalize tag filters using the storage normalization rule
+
+<!-- handsoff-issue-188 -->
+- #188: [vault-registry] Add a pending ownership proposal getter
+
+<!-- handsoff-issue-189 -->
+- #189: [vault-registry] Add explicit expiry to ownership transfer proposals
+
+<!-- handsoff-issue-190 -->
+- #190: [vault-registry] Define a discovery-index retention policy
