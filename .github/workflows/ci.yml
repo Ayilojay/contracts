@@ -19,6 +19,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   STELLAR_CLI_VERSION: "27.0.0"
+  # Pinned cargo-audit version. Bump deliberately (see the audit job's
+  # "Report cargo-audit version" step) so audit behavior only changes when
+  # this file changes, not on every scheduled run.
+  CARGO_AUDIT_VERSION: "0.21.1"
   # Keep in sync with `rust-version` in Cargo.toml.
   MSRV: "1.91"
 
@@ -55,8 +59,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Pinned to CARGO_AUDIT_VERSION so the audit tool does not drift
+      # independently of repository updates. To update: bump the env value
+      # above in a dedicated PR and confirm the audit still passes.
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION"
+
+      - name: Report cargo-audit version
+        run: |
+          installed=$(cargo audit --version)
+          echo "cargo-audit: $installed"
+          echo "cargo-audit: $installed" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$installed" != "cargo-audit $CARGO_AUDIT_VERSION" ]; then
+            echo "::error::Installed cargo-audit ($installed) does not match pinned version ($CARGO_AUDIT_VERSION)"
+            exit 1
+          fi
 
       - name: Audit workspace lockfile
         run: cargo audit --file Cargo.lock
