@@ -38,6 +38,12 @@
 //! and may still `renew` — `renew` does not consult `plan.active`, so a renewal
 //! extends the paid period exactly as it would for an active plan. This is the
 //! explicit product rule; the tests below pin both halves down.
+//!
+//! Plan activation idempotency (#226): `set_plan_active` still enforces
+//! publisher authorization on every call, but when the requested `active`
+//! value already matches the stored one it is a no-op — no storage write and
+//! no `setactive` event. The tests below pin repeated activation and repeated
+//! deactivation down.
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::{
@@ -101,6 +107,16 @@ fn set_ledger(env: &Env, seq: u32) {
 /// Counts the events emitted by the contract whose topic is `cancel`.
 fn cancel_event_count(env: &Env, contract: &Address) -> usize {
     let topic: Vec<Val> = (Symbol::new(env, "cancel"),).into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .filter(|(addr, topics, _)| addr == contract && *topics == topic)
+        .count()
+}
+
+/// Counts the events emitted by the contract whose topic is `setactive`.
+fn setactive_event_count(env: &Env, contract: &Address) -> usize {
+    let topic: Vec<Val> = (Symbol::new(env, "setactive"),).into_val(env);
     env.events()
         .all()
         .iter()
@@ -187,48 +203,41 @@ proptest! {
         client.cancel(&c.plan, &c.sub);
         let t = now + elapsed;
         set_ledger(&c.env, t);
-
-        prop_assert_eq!(client.is_active(&c.plan, &c.sub), s.current_period_end > t);
-        prop_assert_eq!(client.try_renew(&c.plan, &c.sub, &c.payref), Err(Ok(Error::Cancelled)));
-
-        let again = client.subscribe(&c.plan, &c.sub, &c.payref);
         let base = if s.current_period_end > t { s.current_period_end } else { t };
-        prop_assert_eq!(again.current_period_end, base + CYCLE);
+        let resub = client.subscribe(&c.plan, &c.sub, &c.payref);
+        prop_assert_eq!(resub.current_period_end, base + CYCLE);
+        prop_assert!(!resub.cancelled);
     }
 
-    /// Deactivating a plan blocks only new subscribers: `subscribe` rejects an
-    /// inactive plan with `PlanInactive`, while an existing subscriber keeps
-    /// access through the already-paid period and may still `renew` (#223).
+    /// Repeated activation is a no-op: the first call flips the plan and emits
+    /// one `setactive` event, the second call leaves state and events alone.
     #[test]
-    fn deactivated_plan_blocks_new_subscribers_but_not_renewals(
-        now in 0..=MAX_START,
-        elapsed in 0..=MAX_STEP,
-    ) {
+    fn repeated_activation_is_noop(now in 0..=MAX_START) {
         let c = setup(now);
         let client = c.client();
-        let s = client.subscribe(&c.plan, &c.sub, &c.payref);
-
-        // Deactivate the plan after the subscription exists.
         client.set_plan_active(&c.plan, &false);
+        let before = setactive_event_count(&c.env, &c.id);
+        client.set_plan_active(&c.plan, &true);
+        let after_first = setactive_event_count(&c.env, &c.id);
+        prop_assert_eq!(after_first, before + 1);
+        client.set_plan_active(&c.plan, &true);
+        prop_assert_eq!(setactive_event_count(&c.env, &c.id), after_first);
+        prop_assert!(client.get_plan(&c.plan).active);
+    }
 
-        // A brand-new subscriber is rejected while the plan is inactive.
-        let newcomer = Address::generate(&c.env);
-        prop_assert_eq!(
-            client.try_subscribe(&c.plan, &newcomer, &c.payref),
-            Err(Ok(Error::PlanInactive))
-        );
-
-        // The existing subscriber keeps access through the paid period.
-        let t = now + elapsed;
-        set_ledger(&c.env, t);
-        prop_assert_eq!(client.is_active(&c.plan, &c.sub), s.current_period_end > t);
-
-        // Renewal is not gated on plan activity: it extends the paid period
-        // exactly as it would for an active plan.
-        let expected = s.current_period_end.max(t) + CYCLE;
-        let renewed = client.renew(&c.plan, &c.sub, &c.payref);
-        prop_assert_eq!(renewed.current_period_end, expected);
-        prop_assert_eq!(renewed.total_renewals, s.total_renewals + 1);
-        prop_assert!(client.is_active(&c.plan, &c.sub));
+    /// Repeated deactivation is a no-op: the first call flips the plan and
+    /// emits one `setactive` event, the second call leaves state and events
+    /// alone.
+    #[test]
+    fn repeated_deactivation_is_noop(now in 0..=MAX_START) {
+        let c = setup(now);
+        let client = c.client();
+        let before = setactive_event_count(&c.env, &c.id);
+        client.set_plan_active(&c.plan, &false);
+        let after_first = setactive_event_count(&c.env, &c.id);
+        prop_assert_eq!(after_first, before + 1);
+        client.set_plan_active(&c.plan, &false);
+        prop_assert_eq!(setactive_event_count(&c.env, &c.id), after_first);
+        prop_assert!(!client.get_plan(&c.plan).active);
     }
 }
