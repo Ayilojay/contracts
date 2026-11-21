@@ -291,3 +291,14 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-194 -->
 - #194: [vault-registry] Add creator-filtered resource discovery
+<!-- handsoff-issue-187 -->
+- #187: [vault-registry] Normalize tag filters using the storage normalization rule
+
+<!-- handsoff-issue-188 -->
+- #188: [vault-registry] Add a pending ownership proposal getter
+
+<!-- handsoff-issue-189 -->
+- #189: [vault-registry] Add explicit expiry to ownership transfer proposals
+
+<!-- handsoff-issue-190 -->
+- #190: [vault-registry] Define a discovery-index retention policy
