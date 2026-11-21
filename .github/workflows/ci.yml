@@ -181,12 +181,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Single maintained source of the Stellar CLI version, shared with the
+      # deploy workflows via the reusable install action.
       - name: Install Stellar CLI
-        run: |
-          curl -sL \
-            "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
-            | sudo tar xz -C /usr/local/bin
-          stellar --version
+        uses: ./.github/actions/install-stellar-cli
 
       # soroban-sdk >= 25 refuses plain `cargo build` for wasm; the CLI
       # builds and post-processes (spec shaking) the contracts.
@@ -236,5 +234,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: wasm-contracts
-          path: target/wasm32v1-none/release/*.wasm
+          path: |
+            target/wasm32v1-none/release/*.wasm
+            target/wasm32v1-none/release/SHA256SUMS
+            target/wasm32v1-none/release/build-manifest.json
           retention-days: 14
