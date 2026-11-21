@@ -243,3 +243,6 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-190 -->
 - #190: [vault-registry] Define a discovery-index retention policy
+
+<!-- handsoff-issue-185 -->
+- #185: [vault-registry] Add a bounded scan window to list_ids
