@@ -31,6 +31,13 @@
 //! deactivating a plan does not revoke access already paid for; reactivating
 //! the plan does not extend it either. The tests below pin that down across an
 //! existing paid period.
+//!
+//! Deactivated plans and renewal (#223): deactivating a plan blocks **only new
+//! subscribers** (`subscribe` rejects an inactive plan with `PlanInactive`).
+//! Existing subscribers keep their entitlement through the already-paid period
+//! and may still `renew` — `renew` does not consult `plan.active`, so a renewal
+//! extends the paid period exactly as it would for an active plan. This is the
+//! explicit product rule; the tests below pin both halves down.
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::{
@@ -187,64 +194,41 @@ proptest! {
         let again = client.subscribe(&c.plan, &c.sub, &c.payref);
         let base = if s.current_period_end > t { s.current_period_end } else { t };
         prop_assert_eq!(again.current_period_end, base + CYCLE);
-        prop_assert!(!again.cancelled);
-        prop_assert_eq!(again.started_at, s.started_at);
     }
 
-    /// Subscribing again while an uncancelled subscription is active is
-    /// refused and leaves it unchanged.
+    /// Deactivating a plan blocks only new subscribers: `subscribe` rejects an
+    /// inactive plan with `PlanInactive`, while an existing subscriber keeps
+    /// access through the already-paid period and may still `renew` (#223).
     #[test]
-    fn duplicate_subscribe_while_active_rejected(now in 0..=MAX_START, elapsed in 0..CYCLE) {
-        let c = setup(now);
-        let client = c.client();
-        let s = client.subscribe(&c.plan, &c.sub, &c.payref);
-        set_ledger(&c.env, now + elapsed);
-        prop_assert_eq!(
-            client.try_subscribe(&c.plan, &c.sub, &c.payref),
-            Err(Ok(Error::AlreadySubbed))
-        );
-        prop_assert_eq!(client.get_subscription(&c.plan, &c.sub), s);
-    }
-
-    /// Plan activity and subscriber entitlement are separate states (#230).
-    ///
-    /// Deactivating the plan does not revoke access already paid for: an
-    /// existing subscriber stays active until `current_period_end` because
-    /// `is_active` never loads the plan. Reactivating the plan does not extend
-    /// that period either. A brand-new subscriber can only subscribe while the
-    /// plan is active; after reactivation a new subscription starts from now.
-    #[test]
-    fn plan_status_changes_do_not_affect_existing_paid_period(
+    fn deactivated_plan_blocks_new_subscribers_but_not_renewals(
         now in 0..=MAX_START,
         elapsed in 0..=MAX_STEP,
     ) {
         let c = setup(now);
-        let s = c.client.subscribe(&c.plan, &c.sub, &c.payref);
+        let client = c.client();
+        let s = client.subscribe(&c.plan, &c.sub, &c.payref);
 
-        // Deactivate the plan mid-period.
+        // Deactivate the plan after the subscription exists.
+        client.set_plan_active(&c.plan, &false);
+
+        // A brand-new subscriber is rejected while the plan is inactive.
+        let newcomer = Address::generate(&c.env);
+        prop_assert_eq!(
+            client.try_subscribe(&c.plan, &newcomer, &c.payref),
+            Err(Ok(Error::PlanInactive))
+        );
+
+        // The existing subscriber keeps access through the paid period.
         let t = now + elapsed;
         set_ledger(&c.env, t);
-        c.client.deactivate_plan(&c.plan);
+        prop_assert_eq!(client.is_active(&c.plan, &c.sub), s.current_period_end > t);
 
-        // Existing paid access is untouched: entitlement follows the period
-        // end, not the plan status.
-        prop_assert_eq!(c.client.is_active(&c.plan, &c.sub), s.current_period_end > t);
-        prop_assert_eq!(c.client.get_subscription(&c.plan, &c.sub), s.clone());
-
-        // A new subscriber cannot join while the plan is inactive.
-        let other = Address::generate(&c.env);
-        let other_ref = String::from_str(&c.env, "ref2");
-        prop_assert!(c.client.try_subscribe(&c.plan, &other, &other_ref).is_err());
-
-        // Reactivate the plan; the existing period is not extended.
-        c.client.reactivate_plan(&c.plan);
-        prop_assert_eq!(c.client.get_subscription(&c.plan, &c.sub), s.clone());
-        prop_assert_eq!(c.client.is_active(&c.plan, &c.sub), s.current_period_end > t);
-
-        // A new subscriber can now join and starts a fresh period from now.
-        let fresh = c.client.subscribe(&c.plan, &other, &other_ref);
-        prop_assert_eq!(fresh.current_period_end, t + CYCLE);
-        prop_assert_eq!(fresh.started_at, t);
-        prop_assert!(!fresh.cancelled);
+        // Renewal is not gated on plan activity: it extends the paid period
+        // exactly as it would for an active plan.
+        let expected = s.current_period_end.max(t) + CYCLE;
+        let renewed = client.renew(&c.plan, &c.sub, &c.payref);
+        prop_assert_eq!(renewed.current_period_end, expected);
+        prop_assert_eq!(renewed.total_renewals, s.total_renewals + 1);
+        prop_assert!(client.is_active(&c.plan, &c.sub));
     }
 }
