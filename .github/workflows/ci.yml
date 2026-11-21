@@ -19,6 +19,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   STELLAR_CLI_VERSION: "27.0.0"
+  # Keep in sync with `rust-version` in Cargo.toml.
+  MSRV: "1.91"
 
 jobs:
   check-events:
@@ -42,6 +44,9 @@ jobs:
   audit:
     name: Dependency audit (cargo-audit)
     runs-on: ubuntu-latest
+    # cargo-audit is compiled from source on a cold cache, which dominates
+    # runtime; 20 minutes leaves headroom for a slow crates.io fetch.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
@@ -56,9 +61,37 @@ jobs:
       - name: Audit workspace lockfile
         run: cargo audit --file Cargo.lock
 
+  msrv:
+    name: MSRV check (${{ env.MSRV }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust ${{ env.MSRV }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+          targets: wasm32v1-none
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify declared rust-version matches MSRV
+        run: |
+          declared=$(grep -E '^rust-version' Cargo.toml | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "Cargo.toml rust-version: $declared"
+          echo "CI MSRV: $MSRV"
+          if [ "$declared" != "$MSRV" ]; then
+            echo "::error::Cargo.toml rust-version ($declared) does not match CI MSRV ($MSRV)"
+            exit 1
+          fi
+
+      - name: Locked dependency check on MSRV
+        run: cargo check --workspace --all-targets --locked
+
   lint:
     name: Format + Clippy + Docs
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
@@ -84,6 +117,7 @@ jobs:
   test:
     name: Test contracts
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -109,6 +143,7 @@ jobs:
   test-workspace:
     name: Test workspace
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -130,7 +165,12 @@ jobs:
   build:
     name: Build WASM
     runs-on: ubuntu-latest
-    needs: [lint, test, test-workspace]
+    # Artifact production is gated on the complete validation set: lint, tests,
+    # docs/event/error sync checks, and the dependency audit. GitHub Actions
+    # skips this job (and its artifact upload) if any prerequisite fails or is
+    # skipped, so a failed check prevents WASM artifacts from being produced.
+    needs: [lint, test, test-workspace, check-events, check-errors, audit]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -155,10 +195,29 @@ jobs:
 
       - name: Report WASM sizes
         run: |
+          # Explicit expected artifact list: every contract must produce a
+          # non-empty WASM file. A missing or empty artifact fails the step
+          # instead of silently iterating an empty glob.
+          expected_contracts=("access_lease" "subscription" "vault_registry")
+          wasm_dir="target/wasm32v1-none/release"
+
           echo "| Contract | Size (bytes) |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          for f in target/wasm32v1-none/release/*.wasm; do
+
+          missing=0
+          for contract in "${expected_contracts[@]}"; do
+            f="$wasm_dir/${contract}.wasm"
+            if [ ! -f "$f" ]; then
+              echo "::error::Expected WASM artifact not found: $f"
+              missing=1
+              continue
+            fi
             size=$(stat -c%s "$f")
+            if [ "$size" -eq 0 ]; then
+              echo "::error::Expected WASM artifact is empty: $f"
+              missing=1
+              continue
+            fi
             echo "$(basename "$f"): $size bytes"
             echo "| $(basename "$f") | $size |" >> "$GITHUB_STEP_SUMMARY"
             # Soroban rejects contracts over 64 KiB.
@@ -167,6 +226,11 @@ jobs:
               exit 1
             fi
           done
+
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::One or more expected WASM artifacts are missing or empty"
+            exit 1
+          fi
 
       - name: Upload WASM artifacts
         uses: actions/upload-artifact@v7
