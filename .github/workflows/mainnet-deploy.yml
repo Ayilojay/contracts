@@ -12,6 +12,14 @@ on:
         required: false
         type: string
 
+# Serialize all mainnet deployment runs into a single group so at most one
+# proceeds at a time. cancel-in-progress is false so an in-flight deployment
+# (and its on-chain transaction sequence) is never cancelled midway; queued
+# runs wait for the active one to finish instead.
+concurrency:
+  group: mainnet-deploy
+  cancel-in-progress: false
+
 permissions:
   contents: write
   actions: read
@@ -307,3 +315,7 @@ jobs:
           path: deployed/checkpoints/*.env
           if-no-files-found: warn
           retention-days: 30
+              exit 1
+            fi
+            echo "::notice::${PKG} verified (admin + version ${EXPECTED_VERSION})"
+          done

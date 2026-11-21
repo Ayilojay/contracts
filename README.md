@@ -249,3 +249,5 @@ MIT © 2025 Busiii-adetiba
 
 <!-- handsoff-issue-186 -->
 - #186: [vault-registry] Return a continuation cursor for filtered listing
+<!-- handsoff-issue-224 -->
+- #224: [subscription] Bound payment-reference payload lengths
