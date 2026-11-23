@@ -251,3 +251,6 @@ MIT © 2025 Busiii-adetiba
 - #186: [vault-registry] Return a continuation cursor for filtered listing
 <!-- handsoff-issue-224 -->
 - #224: [subscription] Bound payment-reference payload lengths
+
+<!-- handsoff-issue-179 -->
+- #179: [deployment] Detect protected-branch push failures before deployment
