@@ -315,7 +315,3 @@ jobs:
           path: deployed/checkpoints/*.env
           if-no-files-found: warn
           retention-days: 30
-              exit 1
-            fi
-            echo "::notice::${PKG} verified (admin + version ${EXPECTED_VERSION})"
-          done

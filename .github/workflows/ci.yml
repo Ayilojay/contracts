@@ -31,6 +31,9 @@ env:
   # "Report cargo-audit version" step) so audit behavior only changes when
   # this file changes, not on every scheduled run.
   CARGO_AUDIT_VERSION: "0.21.1"
+  # Pinned stable compiler. Must match rust-toolchain.toml and be >= MSRV.
+  # To update: bump here, in rust-toolchain.toml, and confirm CI passes.
+  RUST_STABLE_VERSION: "1.100.0"
   # Keep in sync with `rust-version` in Cargo.toml.
   MSRV: "1.91"
 
@@ -57,6 +60,20 @@ jobs:
       - name: Check Error enums match docs/CONTRACTS.md
         run: python3 scripts/check_errors.py
 
+  lint-workflows:
+    name: Workflow syntax lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Lint all workflow files
+        # Runs scripts/lint_workflows.py against every file in .github/workflows/.
+        # Fails if any job is missing runs-on+steps or a uses: reusable reference,
+        # making incomplete job stubs (no runner, no steps) detectable before merge.
+        run: python3 scripts/lint_workflows.py
+
   audit:
     name: Dependency audit (cargo-audit)
     runs-on: ubuntu-latest
@@ -69,7 +86,9 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
 
       - uses: Swatinem/rust-cache@v2
 
@@ -131,8 +150,9 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
           targets: wasm32v1-none
           components: rustfmt, clippy
 
@@ -159,8 +179,9 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
           targets: wasm32v1-none
 
       - uses: Swatinem/rust-cache@v2
@@ -201,8 +222,9 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
           targets: wasm32v1-none
 
       - uses: Swatinem/rust-cache@v2
@@ -248,7 +270,7 @@ jobs:
     # docs/event/error sync checks, and the dependency audit. GitHub Actions
     # skips this job (and its artifact upload) if any prerequisite fails or is
     # skipped, so a failed check prevents WASM artifacts from being produced.
-    needs: [lint, test, test-workspace, check-events, check-errors, audit]
+    needs: [lint, test, test-workspace, check-events, check-errors, audit, lint-workflows, msrv]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -256,8 +278,9 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Install Rust stable + wasm32v1-none
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_STABLE_VERSION }}
           targets: wasm32v1-none
 
       - uses: Swatinem/rust-cache@v2
