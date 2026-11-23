@@ -1,8 +1,12 @@
 [toolchain]
-channel = "stable"
+# Explicit version so that rebuilding the same commit always uses the same
+# compiler. To update: change the version here, in RUST_STABLE_VERSION in
+# .github/workflows/ci.yml, and confirm CI passes before merging.
+channel = "1.100.0"
 targets = ["wasm32v1-none"]
 components = ["rustfmt", "clippy"]
 
-# The workspace declares rust-version = "1.91" in Cargo.toml.
-# CI exercises that minimum via `cargo +1.91 check --locked` (see .github/workflows).
-# Keep this pin in sync with the declared MSRV.
+# The workspace declares rust-version = "1.91" in Cargo.toml (MSRV).
+# CI exercises the MSRV via `cargo +1.91 check --locked` (see .github/workflows).
+# The channel above is the pinned stable used for all other CI jobs and local
+# development; it is intentionally higher than the MSRV.
